@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"image"
+	"image/color"
 	"image/png"
 	"log"
 	"os"
@@ -65,31 +66,35 @@ func main() {
 			for y := 0; y < size.Y; y++ {
 				cr, cg, cb, ca := cur.At(x, y).RGBA()
 				pr, pg, pb, pa := img.At(x, y).RGBA()
+				src := fmt.Sprintf("%02X%02X%02X%02X", uint8(pr), uint8(pg), uint8(pb), uint8(pa))
+				dst := ""
 
 				if cr != pr || cg != pg || cb != pb || ca != pa {
-					src := fmt.Sprintf("%02X%02X%02X%02X", uint8(pr), uint8(pg), uint8(pb), uint8(pa))
-					dst := fmt.Sprintf("%02X%02X%02X%02X", uint8(cr), uint8(cg), uint8(cb), uint8(ca))
+					dst = fmt.Sprintf("%02X%02X%02X%02X", uint8(cr), uint8(cg), uint8(cb), uint8(ca))
+				} else {
+					dst = src
+				}
 
-					if v, ok := str[src]; !ok {
-						str[src] = dst
-					} else if v != dst {
-						k4++
-						if k4 == 256 {
-							k4 = 0
-							k3++
-						}
-						if k3 == 256 {
-							k3 = 0
-							k2++
-						}
-						if k2 == 256 {
-							k2 = 0
-							k1++
-						}
-						if k1 == 256 {
-							log.Fatalf("overflowed, can not transform %d-th image even with new images\n", k+1)
-						}
+				if v, ok := str[src]; !ok {
+					str[src] = dst
+				} else if v != dst {
+					k4++
+					if k4 == 256 {
+						k4 = 0
+						k3++
 					}
+					if k3 == 256 {
+						k3 = 0
+						k2++
+					}
+					if k2 == 256 {
+						k2 = 0
+						k1++
+					}
+					if k1 == 256 {
+						log.Fatalf("overflowed, can not transform %d-th image even with new images\n", k+1)
+					}
+					newimg.Set(x, y, color.RGBA{uint8(k1), uint8(k2), uint8(k3), uint8(k4)})
 				}
 			}
 		}
@@ -126,7 +131,7 @@ func main() {
 	}
 
 	if k1+k2+k3+k4 != 0 {
-		f, e := os.OpenFile("new.png", os.O_RDWR|os.O_CREATE, 0755)
+		f, e := os.OpenFile("new.png", os.O_RDWR|os.O_CREATE, 0644)
 		if e != nil {
 			log.Fatal(e)
 		}
