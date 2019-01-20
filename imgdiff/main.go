@@ -56,7 +56,7 @@ func main() {
 	k1 := 0
 	k2 := 0
 	k3 := 0
-	k4 := 0
+	k4 := 0x41
 
 	for k, l := 1, len(images); k < l; k++ {
 		str := map[string]string{}
@@ -78,11 +78,8 @@ func main() {
 				if v, ok := str[src]; !ok {
 					str[src] = dst
 				} else if v != dst {
-					k4++
-					if k4 == 256 {
-						k4 = 0
-						k3++
-					}
+					newimg.SetRGBA(x, y, color.RGBA{uint8(k1), uint8(k2), uint8(k3), uint8(k4)})
+					k3++
 					if k3 == 256 {
 						k3 = 0
 						k2++
@@ -94,7 +91,6 @@ func main() {
 					if k1 == 256 {
 						log.Fatalf("overflowed, can not transform %d-th image even with new images\n", k+1)
 					}
-					newimg.Set(x, y, color.RGBA{uint8(k1), uint8(k2), uint8(k3), uint8(k4)})
 				}
 			}
 		}
@@ -130,7 +126,7 @@ func main() {
 		}
 	}
 
-	if k1+k2+k3+k4 != 0 {
+	if k1+k2+k3+k4 != 0x41 {
 		f, e := os.OpenFile("new.png", os.O_RDWR|os.O_CREATE, 0644)
 		if e != nil {
 			log.Fatal(e)
