@@ -45,7 +45,7 @@ func main() {
 	}
 
 	for k, l := 1, len(images); k < l; k++ {
-		str := &strings.Builder{}
+		str := map[string]string{}
 		cur := images[k]
 
 		for x := 0; x < size.X; x++ {
@@ -54,16 +54,23 @@ func main() {
 				pr, pg, pb, pa := img.At(x, y).RGBA()
 
 				if cr != pr || cg != pg || cb != pb || ca != pa {
-					fmt.Fprintf(str, ";%s=%s",
-						fmt.Sprintf("%02X%02X%02X%02X", pr, pg, pb, pa),
-						fmt.Sprintf("%02X%02X%02X%02X", cr, cg, cb, ca),
-					)
+					src := fmt.Sprintf("%02X%02X%02X%02X", uint8(pr), uint8(pg), uint8(pb), uint8(pa))
+					dst := fmt.Sprintf("%02X%02X%02X%02X", uint8(cr), uint8(cg), uint8(cb), uint8(ca))
+
+					if v, ok := str[src]; !ok {
+						str[src] = dst
+					} else if v != dst {
+						str[v] = dst
+					}
 				}
 			}
 		}
 
-		if len(str.String()) != 0 {
-			fmt.Printf("#%d: ?replace%s\n", k+1, str)
+		out := &strings.Builder{}
+		fmt.Fprintf(out, "#%d: ?replace", k+1)
+		for k, v := range str {
+			fmt.Fprintf(out, ";%s=%s", k, v)
 		}
+		fmt.Println(out)
 	}
 }
