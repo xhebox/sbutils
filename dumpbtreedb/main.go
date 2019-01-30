@@ -30,15 +30,16 @@ func main() {
 		if e != nil {
 			return e
 		}
-		defer z.Close()
 
 		f, e := os.OpenFile("tree1_"+hex.EncodeToString(record.Key), os.O_RDWR|os.O_CREATE, 0644)
 		if e != nil {
 			return e
 		}
-		defer f.Close()
 
 		io.Copy(f, z)
+
+		z.Close()
+		f.Close()
 		return nil
 	})
 	if e != nil {
@@ -51,15 +52,15 @@ func main() {
 		if e != nil {
 			return e
 		}
-		defer z.Close()
 
 		f, e := os.OpenFile("tree2_"+hex.EncodeToString(record.Key), os.O_RDWR|os.O_CREATE, 0644)
 		if e != nil {
 			return e
 		}
-		defer f.Close()
 
 		io.Copy(f, z)
+		z.Close()
+		f.Close()
 		return nil
 	})
 	if e != nil {
