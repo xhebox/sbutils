@@ -18,7 +18,7 @@ import (
 func main() {
 	var in, dir string
 	flag.StringVar(&in, "i", "input", "db file")
-	flag.StringVar(&dir, "d", "dir", "input dir file")
+	flag.StringVar(&dir, "d", "dir", "records dir")
 	flag.Parse()
 	log.SetFlags(log.Llongfile)
 

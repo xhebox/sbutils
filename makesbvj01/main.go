@@ -13,10 +13,8 @@ import (
 
 func main() {
 	var in, mode string
-	var skip int
 	flag.StringVar(&in, "i", "input", "input file")
 	flag.StringVar(&mode, "m", "vj", "vjmagic/vj/raw")
-	flag.IntVar(&skip, "n", 0, "skip first n bytes")
 	flag.Parse()
 	log.SetFlags(log.Llongfile)
 
@@ -25,7 +23,6 @@ func main() {
 		log.Fatalln(e)
 	}
 
-	contents = contents[skip:]
 	switch mode {
 	case "raw":
 		var r interface{}
