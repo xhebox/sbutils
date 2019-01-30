@@ -1,2 +1,7 @@
 imgdiff/imgdiff
 imgdiff/*.png
+makesbvj01/makesbvj01
+dumpsbvj01/dumpsbvj01
+dumpbtreedb/dumpbtreedb
+makebtreedb/makebtreedb
+*/*.exe
