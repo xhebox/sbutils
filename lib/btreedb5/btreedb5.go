@@ -132,7 +132,7 @@ func (h *BTreeDB5) marshalHeader() {
 	big.PutInt64(h.fmap[54:], h.Tree2.Size)
 	big.PutInt32(h.fmap[62:], int32(h.Tree2.RootBlock))
 
-	h.order = h.BlockSize/(h.KeySize+4) - 1
+	h.order = (h.BlockSize - 11) / (h.KeySize + 4)
 }
 
 func (h *BTreeDB5) unmarshalHeader() {
@@ -152,7 +152,7 @@ func (h *BTreeDB5) unmarshalHeader() {
 	h.Tree2.Size = big.Int64(h.fmap[54:])
 	h.Tree2.RootBlock = int(big.Int32(h.fmap[62:]))
 
-	h.order = h.BlockSize/(h.KeySize+4) - 1
+	h.order = (h.BlockSize - 11) / (h.KeySize + 4)
 }
 
 func (h *BTreeDB5) freelist_new(s, t int) {
