@@ -3,11 +3,13 @@
 ```
 Usage of ./dumpsbvj01:
   -i string
-        input file (default "input")
+        versioned json file (default "input")
   -m string
         vjmagic/vj/raw (default "vj")
   -n int
         skip first n bytes
+  -o string
+        output json (default "stdout")
 ```
 
 this program will read a versioned json, unserialize it.

@@ -14,9 +14,10 @@ import (
 )
 
 func main() {
-	var in, mode string
+	var in, out, mode string
 	var skip int
-	flag.StringVar(&in, "i", "input", "input file")
+	flag.StringVar(&in, "i", "input", "versioned json file")
+	flag.StringVar(&out, "o", "stdout", "output json")
 	flag.StringVar(&mode, "m", "vj", "vjmagic/vj/raw")
 	flag.IntVar(&skip, "n", 0, "skip first n bytes")
 	flag.Parse()
@@ -28,6 +29,20 @@ func main() {
 	}
 
 	contents = contents[skip:]
+
+	var outwt io.Writer
+	if out == "stdout" {
+		outwt = os.Stdout
+	} else {
+		f, e := os.OpenFile(out, os.O_CREATE|os.O_RDWR, 0644)
+		if e != nil {
+			log.Fatalln(e)
+		}
+		defer f.Close()
+
+		outwt = f
+	}
+
 	switch mode {
 	case "raw":
 		r, _, e := sbvj01.ParseRaw(contents, byteorder.BigEndian)
@@ -40,7 +55,10 @@ func main() {
 			log.Fatalln(e)
 		}
 
-		io.Copy(os.Stdout, bytes.NewReader(out))
+		_, e = io.Copy(outwt, bytes.NewReader(out))
+		if e != nil {
+			log.Fatalln(e)
+		}
 	case "vj":
 		r, e := sbvj01.Parse(contents)
 		if e != nil {
@@ -52,7 +70,10 @@ func main() {
 			log.Fatalln(e)
 		}
 
-		io.Copy(os.Stdout, bytes.NewReader(out))
+		_, e = io.Copy(outwt, bytes.NewReader(out))
+		if e != nil {
+			log.Fatalln(e)
+		}
 	case "vjmagic":
 		r, e := sbvj01.ParseMagic(contents)
 		if e != nil {
@@ -64,6 +85,9 @@ func main() {
 			log.Fatalln(e)
 		}
 
-		io.Copy(os.Stdout, bytes.NewReader(out))
+		_, e = io.Copy(outwt, bytes.NewReader(out))
+		if e != nil {
+			log.Fatalln(e)
+		}
 	}
 }

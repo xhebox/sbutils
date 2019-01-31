@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
@@ -12,8 +13,9 @@ import (
 )
 
 func main() {
-	var in, mode string
-	flag.StringVar(&in, "i", "input", "input file")
+	var in, out, mode string
+	flag.StringVar(&in, "i", "input", "input json")
+	flag.StringVar(&out, "o", "stdout", "output versioned json")
 	flag.StringVar(&mode, "m", "vj", "vjmagic/vj/raw")
 	flag.Parse()
 	log.SetFlags(log.Llongfile)
@@ -21,6 +23,19 @@ func main() {
 	contents, e := ioutil.ReadFile(in)
 	if e != nil {
 		log.Fatalln(e)
+	}
+
+	var outwt io.Writer
+	if out == "stdout" {
+		outwt = os.Stdout
+	} else {
+		f, e := os.OpenFile(out, os.O_CREATE|os.O_RDWR, 0644)
+		if e != nil {
+			log.Fatalln(e)
+		}
+		defer f.Close()
+
+		outwt = f
 	}
 
 	switch mode {
@@ -31,7 +46,7 @@ func main() {
 			log.Fatalln(e)
 		}
 
-		if e := sbvj01.WriteRaw(os.Stdout, r, byteorder.BigEndian); e != nil {
+		if e := sbvj01.WriteRaw(outwt, r, byteorder.BigEndian); e != nil {
 			log.Fatalln(e)
 		}
 	case "vj":
@@ -48,7 +63,7 @@ func main() {
 
 		vj := sbvj01.VersionedJson{Id: v["Id"].(string), Version: int(v["Version"].(float64)), Content: v["Content"]}
 
-		if e := sbvj01.Write(os.Stdout, vj); e != nil {
+		if e := sbvj01.Write(outwt, vj); e != nil {
 			log.Fatalln(e)
 		}
 	case "vjmagic":
@@ -65,7 +80,7 @@ func main() {
 
 		vj := sbvj01.VersionedJson{Id: v["Id"].(string), Version: int(v["Version"].(float64)), Content: v["Content"]}
 
-		if e := sbvj01.WriteMagic(os.Stdout, vj); e != nil {
+		if e := sbvj01.WriteMagic(outwt, vj); e != nil {
 			log.Fatalln(e)
 		}
 	}
