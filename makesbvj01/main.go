@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"io"
@@ -42,7 +43,10 @@ func main() {
 	case "raw":
 		var r interface{}
 
-		if e := json.Unmarshal(contents, r); e != nil {
+		d := json.NewDecoder(bytes.NewReader(contents))
+		d.UseNumber()
+
+		if e := d.Decode(&r); e != nil {
 			log.Fatalln(e)
 		}
 
@@ -52,7 +56,10 @@ func main() {
 	case "vj":
 		var r interface{}
 
-		if e := json.Unmarshal(contents, &r); e != nil {
+		d := json.NewDecoder(bytes.NewReader(contents))
+		d.UseNumber()
+
+		if e := d.Decode(&r); e != nil {
 			log.Fatalln(e)
 		}
 
@@ -61,7 +68,12 @@ func main() {
 			log.Fatalln("not a versioned json?")
 		}
 
-		vj := sbvj01.VersionedJson{Id: v["Id"].(string), Version: int(v["Version"].(float64)), Content: v["Content"]}
+		version, e := v["version"].(json.Number).Int64()
+		if e != nil {
+			log.Fatalln(e)
+		}
+
+		vj := sbvj01.VersionedJson{Id: v["id"].(string), Version: int(version), Content: v["content"]}
 
 		if e := sbvj01.Write(outwt, vj); e != nil {
 			log.Fatalln(e)
@@ -69,7 +81,10 @@ func main() {
 	case "vjmagic":
 		var r interface{}
 
-		if e := json.Unmarshal(contents, &r); e != nil {
+		d := json.NewDecoder(bytes.NewReader(contents))
+		d.UseNumber()
+
+		if e := d.Decode(&r); e != nil {
 			log.Fatalln(e)
 		}
 
@@ -78,7 +93,12 @@ func main() {
 			log.Fatalln("not a versioned json?")
 		}
 
-		vj := sbvj01.VersionedJson{Id: v["Id"].(string), Version: int(v["Version"].(float64)), Content: v["Content"]}
+		version, e := v["version"].(json.Number).Int64()
+		if e != nil {
+			log.Fatalln(e)
+		}
+
+		vj := sbvj01.VersionedJson{Id: v["id"].(string), Version: int(version), Content: v["content"]}
 
 		if e := sbvj01.WriteMagic(outwt, vj); e != nil {
 			log.Fatalln(e)

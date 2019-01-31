@@ -2,6 +2,7 @@ package sbvj01
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 
 	"github.com/pkg/errors"
@@ -23,10 +24,10 @@ const (
 )
 
 type VersionedJson struct {
-	Id      string
+	Id      string `json:"id"`
 	endian  byteorder.ByteOrder
-	Version int
-	Content interface{}
+	Version int         `json:"version"`
+	Content interface{} `json:"content"`
 }
 
 func ParseMagic(data []byte) (VersionedJson, error) {
@@ -208,22 +209,42 @@ func WriteRaw(wt io.Writer, anything interface{}, endian byteorder.ByteOrder) er
 		}
 
 		return nil
-	case float64:
-		if n == float64(int64(n)) {
+	case json.Number:
+		m, e := n.Int64()
+		if e == nil {
 			buf[0] = VarintT
 			if _, e := wt.Write(buf); e != nil {
 				return e
 			}
 
-			return writeVarint(wt, int64(n), endian)
-		} else {
-			buf[0] = NumberT
-			if _, e := wt.Write(buf); e != nil {
-				return e
-			}
-
-			return writeNumber(wt, n, endian)
+			return writeVarint(wt, m, endian)
 		}
+
+		buf[0] = NumberT
+		if _, e := wt.Write(buf); e != nil {
+			return e
+		}
+
+		p, e := n.Float64()
+		if e != nil {
+			return e
+		}
+
+		return writeNumber(wt, p, endian)
+	case float64:
+		buf[0] = VarintT
+		if _, e := wt.Write(buf); e != nil {
+			return e
+		}
+
+		return writeNumber(wt, n, endian)
+	case int64:
+		buf[0] = NumberT
+		if _, e := wt.Write(buf); e != nil {
+			return e
+		}
+
+		return writeVarint(wt, n, endian)
 	case bool:
 		buf[0] = BoolT
 		if _, e := wt.Write(buf); e != nil {
@@ -231,13 +252,6 @@ func WriteRaw(wt io.Writer, anything interface{}, endian byteorder.ByteOrder) er
 		}
 
 		return writeBool(wt, n, endian)
-	case int64:
-		buf[0] = VarintT
-		if _, e := wt.Write(buf); e != nil {
-			return e
-		}
-
-		return writeVarint(wt, n, endian)
 	case string:
 		buf[0] = StringT
 		if _, e := wt.Write(buf); e != nil {
