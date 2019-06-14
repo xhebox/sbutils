@@ -18,7 +18,7 @@ func main() {
 	var skip int
 	flag.StringVar(&in, "i", "input", "versioned json file")
 	flag.StringVar(&out, "o", "stdout", "output json")
-	flag.StringVar(&mode, "m", "vj", "vjmagic/vj/raw")
+	flag.StringVar(&mode, "m", "vj", "vjmagic/vj/raw/nvj")
 	flag.IntVar(&skip, "n", 0, "skip first n bytes")
 	flag.Parse()
 	log.SetFlags(log.Llongfile)
@@ -60,7 +60,7 @@ func main() {
 			log.Fatalln(e)
 		}
 	case "vj":
-		r, e := sbvj01.Parse(contents)
+		r, _, e := sbvj01.Parse(contents)
 		if e != nil {
 			log.Fatalln(e)
 		}
@@ -74,8 +74,30 @@ func main() {
 		if e != nil {
 			log.Fatalln(e)
 		}
+	case "nvj":
+		r := int(int8(contents[0]))
+
+		off := 1
+		for i := 0; i < r; i++ {
+			r, l, e := sbvj01.Parse(contents[off:])
+			if e != nil {
+				log.Fatalln(e)
+			}
+
+			out, e := json.MarshalIndent(r, "", "\t")
+			if e != nil {
+				log.Fatalln(e)
+			}
+
+			_, e = io.Copy(outwt, bytes.NewReader(out))
+			if e != nil {
+				log.Fatalln(e)
+			}
+
+			off += l
+		}
 	case "vjmagic":
-		r, e := sbvj01.ParseMagic(contents)
+		r, _, e := sbvj01.ParseMagic(contents)
 		if e != nil {
 			log.Fatalln(e)
 		}

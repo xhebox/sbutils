@@ -2,1167 +2,1214 @@ package btreedb5
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"sort"
-	"strings"
 	"sync"
 
-	mmap "github.com/edsrzf/mmap-go"
 	"github.com/pkg/errors"
 	"github.com/xhebox/bstruct/byteorder"
+	"github.com/xhebox/sbutils/lib/blockfile"
+	"github.com/xhebox/sbutils/lib/data_types"
 )
 
+type direction int
+
 const (
-	DefaultBlocks = 255
-	InterBlock    = 'I'
-	LeafBlock     = 'L'
-	FreeBlock     = 'F'
+	IndexNode = 'I'
+	LeafNode  = 'L'
+	FreeNode  = 'F'
+
+	descend = direction(-1)
+	ascend  = direction(+1)
+	maxptr  = uint(^uint32(0))
 )
 
 var (
 	Magic = []byte{'B', 'T', 'r', 'e', 'e', 'D', 'B', '5'}
-	big   = byteorder.BigEndian
+	zero  = []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 )
 
-type Key []byte
-
-func (t Key) Less(h Key) bool {
-	if len(t) != len(h) {
-		panic("key length is not consistent")
-	}
-
-	for k := range t {
-		if t[k] > h[k] {
-			return false
-		} else if t[k] < h[k] {
-			return true
-		}
-	}
-
-	return false
-}
-
-func (t Key) NonZero() bool {
-	for k := range t {
-		if t[k] != 0 {
-			return true
-		}
-	}
-	return false
-}
-
-type Record struct {
-	Key  Key
-	Data []byte
-	upd  bool
-}
-
-type ii struct {
-	height  int8
-	ptr     int
-	keys    []Key
-	ptrs    []int
-	records []Record
-}
-
 type BTree struct {
-	Un1       bool
-	Cnt       int
-	Size      int64
-	RootBlock int
+	FreeIndex  uint  // HeadFreeIndex
+	Size       int64 // DeviceSize
+	RootBlock  uint
+	RootIsLeaf bool
 }
 
 type BTreeDB5 struct {
-	BlockSize  int
 	Identifier string
+	BlockSize  int
 	KeySize    int
-	Tree1      BTree
-	Tree2      BTree
+	UseAltRoot bool
+	Tree       BTree
 
-	tree     int
-	order    int
-	freelist []int
-	freemu   sync.Mutex
-	rwmu     sync.RWMutex
-	file     *os.File
-	fmap     mmap.MMap
+	used_uncommitted map[uint]bool
+	free_committed   map[uint]bool
+	free_uncommitted map[uint]bool
+	intermax         int
+	freemax          int
+	leafmax          int
+	freemu           sync.Mutex
+	file             *blockfile.BlockFile
 }
 
-func (h *BTreeDB5) Close() error {
-	h.rwmu.Lock()
-	defer h.rwmu.Unlock()
+func intermax(blksz, keysz int) int {
+	return (blksz-2-1-4-4)/(keysz+4) + 1
+}
+
+func freemax(blksz int) int {
+	return (blksz - 2 - 4 - 4) / 4
+}
+
+func New(file string, ident string, blksz, keysz int) (h *BTreeDB5, e error) {
+	h = &BTreeDB5{
+		Identifier: ident,
+		UseAltRoot: false,
+		Tree: BTree{
+			FreeIndex:  maxptr,
+			RootBlock:  maxptr,
+			RootIsLeaf: true,
+		},
+		BlockSize:        blksz,
+		KeySize:          keysz,
+		used_uncommitted: make(map[uint]bool),
+		free_committed:   make(map[uint]bool),
+		free_uncommitted: make(map[uint]bool),
+		freemax:          freemax(blksz),
+		intermax:         intermax(blksz, keysz),
+		leafmax:          2,
+	}
+
+	os.Remove(file)
+
+	h.file, e = blockfile.NewBlockFile(file, 512)
+	if e != nil {
+		return nil, errors.Wrapf(e, "failed to open a block file")
+	}
+
+	h.file.SetBlksz(blksz)
+
+	if e := h.file.Resize(0); e != nil {
+		return nil, errors.Wrapf(e, "failed to resize the block file")
+	}
 
 	h.marshalHeader()
 
-	if e := h.fmap.Flush(); e != nil {
-		return e
-	}
-
-	return h.file.Close()
-}
-
-func (h *BTreeDB5) Flush() error {
-	h.rwmu.Lock()
-	defer h.rwmu.Unlock()
-
-	return h.fmap.Flush()
-}
-
-func (h *BTreeDB5) marshalHeader() {
-	copy(h.fmap, Magic)
-
-	big.PutInt32(h.fmap[8:], int32(h.BlockSize))
-
-	for k := 0; k < 16; k++ {
-		h.fmap[12+k] = 0
-	}
-	copy(h.fmap[12:], h.Identifier[:])
-
-	big.PutInt32(h.fmap[28:], int32(h.KeySize))
-
-	h.Tree1.Size = int64(512 + (h.Tree1.Cnt+1)*h.BlockSize)
-	big.PutBool(h.fmap[32:], h.Tree1.Un1)
-	big.PutInt32(h.fmap[33:], int32(h.Tree1.Cnt))
-	big.PutInt64(h.fmap[37:], h.Tree1.Size)
-	big.PutInt32(h.fmap[45:], int32(h.Tree1.RootBlock))
-
-	h.Tree2.Size = int64(512 + (h.Tree2.Cnt+1)*h.BlockSize)
-	big.PutBool(h.fmap[49:], h.Tree2.Un1)
-	big.PutInt32(h.fmap[50:], int32(h.Tree2.Cnt))
-	big.PutInt64(h.fmap[54:], h.Tree2.Size)
-	big.PutInt32(h.fmap[62:], int32(h.Tree2.RootBlock))
-
-	h.order = (h.BlockSize - 11) / (h.KeySize + 4)
-}
-
-func (h *BTreeDB5) unmarshalHeader() {
-	h.BlockSize = int(big.Int32(h.fmap[8:]))
-
-	h.Identifier = string(h.fmap[12:28])
-
-	h.KeySize = int(big.Int32(h.fmap[28:]))
-
-	h.Tree1.Un1 = big.Bool(h.fmap[32:])
-	h.Tree1.Cnt = int(big.Int32(h.fmap[33:]))
-	h.Tree1.Size = big.Int64(h.fmap[37:])
-	h.Tree1.RootBlock = int(big.Int32(h.fmap[45:]))
-
-	h.Tree2.Un1 = big.Bool(h.fmap[49:])
-	h.Tree2.Cnt = int(big.Int32(h.fmap[50:]))
-	h.Tree2.Size = big.Int64(h.fmap[54:])
-	h.Tree2.RootBlock = int(big.Int32(h.fmap[62:]))
-
-	h.order = (h.BlockSize - 11) / (h.KeySize + 4)
-}
-
-func (h *BTreeDB5) freelist_new(s, t int) {
-	h.freemu.Lock()
-	defer h.freemu.Unlock()
-
-	h.freelist = make([]int, t-s)
-	for k := s; k < t; k++ {
-		h.freelist[k-s] = k
-
-		typ, _, nptr := h.sector(k)
-		typ[0] = FreeBlock
-		typ[1] = FreeBlock
-		big.PutInt32(nptr, -1)
-	}
-}
-
-func (h *BTreeDB5) freelist_push(ptr int) {
-	h.freemu.Lock()
-	defer h.freemu.Unlock()
-
-	for {
-		if ptr == -1 {
-			break
-		}
-
-		typ, _, nptr := h.sector(ptr)
-
-		j := len(h.freelist)
-
-		n := sort.Search(j, func(i int) bool {
-			return h.freelist[i] > ptr
-		})
-
-		if n == 0 || h.freelist[n-1] != ptr {
-			h.freelist = append(h.freelist[:n], append([]int{ptr}, h.freelist[n:]...)...)
-		}
-
-		ptr = int(big.Int32(nptr))
-		big.PutInt32(nptr, -1)
-
-		if typ[0] == FreeBlock {
-			break
-		}
-
-		if typ[0] == InterBlock && ptr == 0 {
-			typ[0] = FreeBlock
-			typ[1] = FreeBlock
-			break
-		}
-
-		typ[0] = FreeBlock
-		typ[1] = FreeBlock
-	}
-}
-
-func (h *BTreeDB5) freelist_pop() (ptr int, e error) {
-	h.freemu.Lock()
-	defer h.freemu.Unlock()
-
-	if len(h.freelist) == 0 {
-		e = h.fmap.Unmap()
-		if e != nil {
-			return
-		}
-
-		if h.tree == 1 {
-			h.Tree1.Cnt *= 2
-			err := h.file.Truncate(int64(512 + h.BlockSize*h.Tree1.Cnt))
-			if err != nil {
-				e = errors.Wrapf(err, "can not resize file")
-				return
-			}
-
-			h.fmap, err = mmap.Map(h.file, mmap.RDWR, 0)
-			if err != nil {
-				e = errors.Wrapf(err, "failed to mmap")
-				return
-			}
-
-			s := h.Tree1.Cnt / 2
-			for k, t := s, h.Tree1.Cnt; k < t; k++ {
-				h.freelist = append(h.freelist, k)
-
-				typ, _, nptr := h.sector(k)
-				typ[0] = FreeBlock
-				typ[1] = FreeBlock
-				big.PutInt32(nptr, -1)
-			}
-
-			e = errors.New("remap")
-		} else {
-			h.Tree2.Cnt *= 2
-			err := h.file.Truncate(int64(512 + h.BlockSize*h.Tree2.Cnt))
-			if err != nil {
-				e = errors.Wrapf(err, "can not resize file")
-				return
-			}
-
-			h.fmap, err = mmap.Map(h.file, mmap.RDWR, 0)
-			if err != nil {
-				e = errors.Wrapf(err, "failed to mmap")
-				return
-			}
-
-			s := h.Tree1.Cnt / 2
-			for k, t := s, h.Tree1.Cnt; k < t; k++ {
-				h.freelist = append(h.freelist, k)
-
-				typ, _, nptr := h.sector(k)
-				typ[0] = FreeBlock
-				typ[1] = FreeBlock
-				big.PutInt32(nptr, -1)
-			}
-
-			e = errors.New("remap")
-		}
-	}
-
-	ptr, h.freelist = h.freelist[0], h.freelist[1:]
-
-	if h.tree == 1 {
-		if ptr > h.Tree1.Cnt {
-			h.Tree1.Cnt = ptr
-		}
-	} else {
-		if ptr > h.Tree2.Cnt {
-			h.Tree2.Cnt = ptr
-		}
-	}
-
-	return
-}
-
-func (h *BTreeDB5) SetTree(p int) {
-	h.rwmu.Lock()
-	defer h.rwmu.Unlock()
-
-	if p != 1 && p != 2 {
-		return
-	}
-
-	h.tree = p
-}
-
-func (h *BTreeDB5) setRoot(p int) {
-	if h.tree == 1 {
-		h.Tree1.RootBlock = p
-	} else {
-		h.Tree2.RootBlock = p
-	}
-}
-
-func (h *BTreeDB5) getRoot() int {
-	if h.tree == 1 {
-		return h.Tree1.RootBlock
-	} else {
-		return h.Tree2.RootBlock
-	}
-}
-
-func New(file string, ident string, blocksz, keysz, blocks int) (*BTreeDB5, error) {
-	var e error
-	h := &BTreeDB5{}
-
-	h.file, e = os.OpenFile(file, os.O_CREATE|os.O_RDWR, 0644)
-	if e != nil {
-		return nil, errors.Wrapf(e, "failed to read")
-	}
-
-	if e = h.file.Truncate(int64(512 + blocksz*blocks)); e != nil {
-		return nil, errors.Wrapf(e, "can not resize file")
-	}
-
-	h.fmap, e = mmap.Map(h.file, mmap.RDWR, 0)
-	if e != nil {
-		return nil, errors.Wrapf(e, "failed to mmap")
-	}
-
-	h.BlockSize = blocksz
-	h.Identifier = ident
-	h.KeySize = keysz
-
-	h.Tree1.Cnt = blocks
-	h.Tree1.Size = int64(512 + h.BlockSize*blocks)
-	h.Tree1.RootBlock = 0
-
-	h.Tree2.Cnt = blocks
-	h.Tree2.Size = int64(512 + h.BlockSize*blocks)
-	h.Tree2.RootBlock = 1
-
-	h.marshalHeader()
-
-	h.SetTree(2)
-	if e := h.wll(1, []Record{}); e != nil {
-		return nil, e
-	}
-
-	h.SetTree(1)
-	if e := h.wll(0, []Record{}); e != nil {
-		return nil, e
-	}
-
-	h.freelist_new(2, blocks)
+	h.Tree.RootBlock = h.writeLeafNode(&leafNode{self: maxptr})
 
 	return h, nil
 }
 
-func Load(file string) (*BTreeDB5, error) {
-	var e error
-	h := &BTreeDB5{}
+func Load(file string) (h *BTreeDB5, e error) {
+	h = &BTreeDB5{}
 
-	h.file, e = os.OpenFile(file, os.O_RDWR, 0644)
+	h.file, e = blockfile.NewBlockFile(file, 512)
 	if e != nil {
-		return nil, errors.Wrapf(e, "failed to read")
-	}
-
-	h.fmap, e = mmap.Map(h.file, mmap.RDWR, 0)
-	if e != nil {
-		return nil, errors.Wrapf(e, "failed to mmap")
-	}
-
-	if bytes.Compare(h.fmap[:len(Magic)], Magic) != 0 {
-		return nil, errors.Errorf("magic is not correct")
+		return nil, errors.Wrapf(e, "failed to open a block file")
 	}
 
 	h.unmarshalHeader()
 
-	cnt := h.Tree1.Cnt
-	h.SetTree(1)
-	if h.Tree2.Cnt > cnt {
-		cnt = h.Tree2.Cnt
-		h.SetTree(2)
-	}
+	h.file.SetBlksz(h.BlockSize)
 
-	for k := 0; k < cnt; k++ {
-		typ, _, _ := h.sector(k)
-
-		if typ[0] != typ[1] {
-			return nil, errors.Errorf("type inconsistent, maybe data corrupted on block[%d]", k)
-		}
-
-		if typ[0] == FreeBlock {
-			h.freelist_push(k)
-		}
-	}
+	h.readRoot()
 
 	return h, nil
 }
 
-func (h *BTreeDB5) sector(ptr int) ([]byte, []byte, []byte) {
-	sector := h.fmap[512+ptr*h.BlockSize : 512+(ptr+1)*h.BlockSize]
-
-	return sector[:2], sector[2 : h.BlockSize-4], sector[h.BlockSize-4:]
+func (h *BTreeDB5) Close() error {
+	e := h.Commit()
+	if e != nil {
+		return e
+	}
+	return h.file.Close()
 }
 
-func (h *BTreeDB5) blk(ptr int) (r ii, e error) {
-	r.ptr = ptr
+func (h *BTreeDB5) marshalHeader() {
+	hdr := h.file.Header()
 
-	typ, blk, nptr := h.sector(ptr)
+	copy(hdr, Magic)
 
-	switch typ[0] {
-	case InterBlock:
-		r.height = int8(blk[0])
+	byteorder.BigEndian.PutInt32(hdr[8:], int32(h.BlockSize))
 
-		N := int(big.Int32(blk[1:]))
+	copy(hdr[12+copy(hdr[12:28], h.Identifier[:]):28], zero)
 
-		r.keys = make([]Key, N-1)
-		r.ptrs = make([]int, N)
+	byteorder.BigEndian.PutUint32(hdr[28:], uint32(uint(h.KeySize)))
+}
 
-		m := h.KeySize + 4
-		for k := 0; k < N; k++ {
-			j := 5 + k*m
-			r.ptrs[k] = int(big.Int32(blk[j:]))
-			if k < N-1 {
-				r.keys[k] = append([]byte{}, blk[4+j:4+j+h.KeySize]...)
+func (h *BTreeDB5) writeRoot() {
+	hdr := h.file.Header()
+
+	hdr[32] = byteorder.Bool2Byte(h.UseAltRoot)
+
+	if !h.UseAltRoot {
+		byteorder.BigEndian.PutUint32(hdr[33:], uint32(h.Tree.FreeIndex))
+		byteorder.BigEndian.PutInt64(hdr[37:], h.file.Size())
+		byteorder.BigEndian.PutUint32(hdr[45:], uint32(h.Tree.RootBlock))
+		hdr[49] = byteorder.Bool2Byte(h.Tree.RootIsLeaf)
+	} else {
+		byteorder.BigEndian.PutUint32(hdr[50:], uint32(h.Tree.FreeIndex))
+		byteorder.BigEndian.PutInt64(hdr[54:], h.file.Size())
+		byteorder.BigEndian.PutUint32(hdr[62:], uint32(h.Tree.RootBlock))
+		hdr[66] = byteorder.Bool2Byte(h.Tree.RootIsLeaf)
+	}
+}
+
+func (h *BTreeDB5) unmarshalHeader() {
+	hdr := h.file.Header()
+
+	h.BlockSize = int(byteorder.BigEndian.Int32(hdr[8:]))
+
+	h.Identifier = string(hdr[12:28])
+
+	h.KeySize = int(byteorder.BigEndian.Int32(hdr[28:]))
+}
+
+func (h *BTreeDB5) readRoot() {
+	hdr := h.file.Header()
+
+	h.UseAltRoot = byteorder.Byte2Bool(hdr[32])
+
+	if !h.UseAltRoot {
+		h.Tree.FreeIndex = uint(byteorder.BigEndian.Uint32(hdr[33:]))
+		//h.Tree.Size = byteorder.BigEndian.Int64(hdr[37:])
+		h.Tree.RootBlock = uint(byteorder.BigEndian.Uint32(hdr[45:]))
+		h.Tree.RootIsLeaf = byteorder.Byte2Bool(hdr[49])
+	} else {
+		h.Tree.FreeIndex = uint(byteorder.BigEndian.Uint32(hdr[50:]))
+		//h.Tree.Size = byteorder.BigEndian.Int64(hdr[54:])
+		h.Tree.RootBlock = uint(byteorder.BigEndian.Uint32(hdr[62:]))
+		h.Tree.RootIsLeaf = byteorder.Byte2Bool(hdr[66])
+	}
+
+	h.intermax = intermax(h.BlockSize, h.KeySize)
+}
+
+func (h *BTreeDB5) freeNode(ptr uint) *freeNode {
+	r := &freeNode{}
+
+	block := h.file.Block(ptr)
+
+	if block[0] != FreeNode || block[1] != FreeNode {
+		panic("except correct signature")
+	}
+
+	r.next = uint(byteorder.BigEndian.Uint32(block[2:]))
+
+	N := byteorder.BigEndian.Uint32(block[6:])
+
+	r.ptrs = make([]uint, N)
+
+	off := 10
+	for k := range r.ptrs {
+		r.ptrs[k] = uint(byteorder.BigEndian.Uint32(block[off:]))
+		off += 4
+	}
+
+	return r
+}
+
+func (h *BTreeDB5) indexNode(ptr uint) *indexNode {
+	r := &indexNode{}
+	r.self = ptr
+
+	block := h.file.Block(ptr)
+
+	if block[0] != IndexNode || block[1] != IndexNode {
+		panic("except correct signature")
+	}
+
+	r.height = block[2]
+
+	N := byteorder.BigEndian.Uint32(block[3:])
+
+	r.keys = make([]Key, N)
+	r.ptrs = make([]uint, N+1)
+
+	r.ptrs[0] = uint(byteorder.BigEndian.Uint32(block[7:]))
+
+	off := 11
+	for k := range r.keys {
+		r.keys[k] = make(Key, h.KeySize)
+		off += copy(r.keys[k], block[off:])
+
+		r.ptrs[k+1] = uint(byteorder.BigEndian.Uint32(block[off:]))
+		off += 4
+	}
+
+	return r
+}
+
+func (h *BTreeDB5) leafNode(ptr uint) *leafNode {
+	r := &leafNode{}
+	r.self = ptr
+
+	readers := []io.Reader{}
+
+	for ptr != maxptr {
+		block := h.file.Block(ptr)
+
+		if block[0] != LeafNode || block[1] != LeafNode {
+			panic("except correct signature")
+		}
+
+		readers = append(readers, bytes.NewReader(block[2:h.BlockSize-4]))
+
+		ptr = uint(byteorder.BigEndian.Uint32(block[h.BlockSize-4:]))
+	}
+
+	rd := io.MultiReader(readers...)
+
+	N, e := byteorder.Uint32(rd, byteorder.BigEndian)
+	if e != nil {
+		panic(e)
+	}
+
+	r.keys = make([]Key, N)
+	r.data = make([]ByteArray, N)
+
+	for k := range r.keys {
+		r.keys[k] = make(Key, h.KeySize)
+
+		if _, e := io.ReadFull(rd, r.keys[k]); e != nil {
+			panic(e)
+		}
+
+		e = r.data[k].Read(rd, byteorder.BigEndian)
+		if e != nil {
+			panic(e)
+		}
+	}
+
+	return r
+}
+
+func (h *BTreeDB5) freelist_push(ptr uint) {
+	h.freemu.Lock()
+
+	if ptr != maxptr {
+		if h.used_uncommitted[ptr] {
+			h.used_uncommitted[ptr] = false
+			h.free_committed[ptr] = true
+		} else {
+			h.free_uncommitted[ptr] = true
+		}
+	}
+
+	h.freemu.Unlock()
+}
+
+func (h *BTreeDB5) freelist_gpop() (uint, bool) {
+	r := h.file.Cap()
+
+	e := h.file.Grow(1)
+	if e != nil {
+		panic(e)
+	}
+
+	h.used_uncommitted[r] = true
+	return r, true
+}
+
+func (h *BTreeDB5) freelist_pop() (uint, bool) {
+	h.freemu.Lock()
+
+	var r uint
+
+	if len(h.free_uncommitted) == 0 {
+		if h.Tree.FreeIndex == maxptr {
+			h.freemu.Unlock()
+			return h.freelist_gpop()
+		}
+
+		res := h.freeNode(h.Tree.FreeIndex)
+
+		if len(res.ptrs) == 0 {
+			h.freemu.Unlock()
+			return h.freelist_gpop()
+		}
+
+		ptrs := res.ptrs
+		for k := range ptrs {
+			h.free_uncommitted[ptrs[k]] = true
+		}
+		h.free_committed[h.Tree.FreeIndex] = true
+		h.Tree.FreeIndex = res.next
+	}
+
+	h.used_uncommitted[r] = true
+	m := h.free_uncommitted
+	for k := range m {
+		delete(m, k)
+		h.freemu.Unlock()
+		return k, false
+	}
+
+	h.freemu.Unlock()
+	panic("should not go here")
+}
+
+func (h *BTreeDB5) freelist_clear() {
+	h.freemu.Lock()
+	m := h.free_uncommitted
+	for k := range m {
+		delete(m, k)
+	}
+	m = h.free_committed
+	for k := range m {
+		delete(m, k)
+	}
+	m = h.used_uncommitted
+	for k := range m {
+		delete(m, k)
+	}
+	h.freemu.Unlock()
+}
+
+func (h *BTreeDB5) Rollback() (e error) {
+	defer func() {
+		k := recover()
+		if k != nil {
+			e = errors.Errorf("%+v\n", k)
+		}
+	}()
+
+	h.readRoot()
+	h.freelist_clear()
+	e = h.file.Resize(uint(int((h.file.Size() - 512) / int64(h.BlockSize))))
+	return
+}
+
+func (h *BTreeDB5) commit(total map[uint]bool) {
+	var ptr uint
+
+	k := make([]uint, len(total))
+
+	var i int
+	for key := range total {
+		k[i] = key
+		i++
+	}
+
+	for len(k) != 0 {
+		var node *freeNode = nil
+
+		h.freemu.Lock()
+
+		if h.Tree.FreeIndex != maxptr {
+			node = h.freeNode(h.Tree.FreeIndex)
+			if len(node.ptrs) < h.freemax {
+				ptr = h.Tree.FreeIndex
+			} else {
+				node = nil
 			}
 		}
-	case LeafBlock:
-		r.height = -1
 
-		blks := [][]byte{blk}
-
-		for {
-			ptr = int(big.Int32(nptr))
-
-			if ptr == -1 {
-				break
-			}
-
-			typ, blk, nptr = h.sector(ptr)
-
-			if typ[0] != LeafBlock {
-				e = errors.New("except a leaf block")
-				return
-			}
-
-			blks = append(blks, blk)
+		if node == nil {
+			ptr, k = k[0], k[1:]
+			node = &freeNode{next: h.Tree.FreeIndex}
+			h.Tree.FreeIndex = ptr
 		}
 
-		buf := make([]byte, h.BlockSize*len(blks))
-		off := 0
-		for k, e := 0, len(blks); k < e; k++ {
-			off += copy(buf[off:], blks[k])
+		length := h.freemax - len(node.ptrs)
+		if length > len(k) {
+			length = len(k)
+		}
+		node.ptrs = append(node.ptrs, k[:length]...)
+		k = k[length:]
+
+		h.freemu.Unlock()
+
+		h.writeFreeNode(node, ptr)
+	}
+}
+
+func (h *BTreeDB5) Commit() (e error) {
+	defer func() {
+		k := recover()
+		if k != nil {
+			e = errors.Errorf("%+v\n", k)
+		}
+	}()
+
+	h.writeRoot()
+	h.UseAltRoot = !h.UseAltRoot
+	h.commit(h.free_uncommitted)
+	h.commit(h.free_committed)
+	h.freelist_clear()
+	return
+}
+
+func (h *BTreeDB5) writeFreeNode(node *freeNode, ptr uint) {
+	block := h.file.Block(ptr)
+
+	block[0] = FreeNode
+	block[1] = FreeNode
+	byteorder.BigEndian.PutUint32(block[2:], uint32(node.next))
+	byteorder.BigEndian.PutUint32(block[6:], uint32(len(node.ptrs)))
+
+	off := 10
+	for k := range node.ptrs {
+		byteorder.BigEndian.PutUint32(block[off:], uint32(node.ptrs[k]))
+		off += 4
+	}
+}
+
+func (h *BTreeDB5) writeIndexNode(node *indexNode) uint {
+	h.freelist_push(node.self)
+
+	node.self, _ = h.freelist_pop()
+
+	block := h.file.Block(node.self)
+
+	block[0] = IndexNode
+	block[1] = IndexNode
+	block[2] = node.height
+	byteorder.BigEndian.PutUint32(block[3:], uint32(uint(len(node.ptrs)-1)))
+	byteorder.BigEndian.PutUint32(block[7:], uint32(node.ptrs[0]))
+
+	off := 11
+	for k := range node.keys {
+		off += copy(block[off:], node.keys[k])
+		byteorder.BigEndian.PutUint32(block[off:], uint32(node.ptrs[k+1]))
+		off += 4
+	}
+
+	return node.self
+}
+
+func (h *BTreeDB5) writeLeafNode(node *leafNode) uint {
+	ptr := node.self
+
+	for ptr != maxptr {
+		block := h.file.Block(ptr)
+
+		if block[0] != LeafNode || block[1] != LeafNode {
+			panic("except correct signature")
 		}
 
-		N := int(big.Int32(buf))
-		off = 4
-
-		r.records = make([]Record, N)
-
-		for n := 0; n < N; n++ {
-			r.records[n].Key = buf[off : off+h.KeySize]
-			off += h.KeySize
-
-			size, l, err := big.UVarintB(buf[off:])
-			if err != nil {
-				e = errors.Wrapf(err, "unexpected varint read error")
-				return
-			}
-			off += l
-
-			sz := int(size)
-			r.records[n].Data = buf[off : off+sz]
-			off += sz
-		}
-	default:
 		h.freelist_push(ptr)
+
+		ptr = uint(byteorder.BigEndian.Uint32(block[h.BlockSize-4:]))
+	}
+
+	buf := &bytes.Buffer{}
+
+	e := byteorder.PutUint32(buf, byteorder.BigEndian, uint32(uint(len(node.data))))
+	if e != nil {
+		panic(e)
+	}
+
+	for k := range node.data {
+		_, e = buf.Write(node.keys[k])
+		if e != nil {
+			panic(e)
+		}
+
+		e = node.data[k].Write(buf, byteorder.BigEndian)
+		if e != nil {
+			panic(e)
+		}
+	}
+
+	src := buf.Bytes()
+	end := len(src)
+	off := 0
+	nptr := uint(0)
+	var block []byte
+
+	for off < end {
+		ptr, change := h.freelist_pop()
+
+		if off == 0 {
+			node.self = ptr
+		}
+
+		if len(block) != 0 {
+			if change {
+				block = h.file.Block(nptr)
+			}
+
+			byteorder.BigEndian.PutUint32(block[h.BlockSize-4:], uint32(ptr))
+		}
+
+		block = h.file.Block(ptr)
+
+		block[0] = LeafNode
+		block[1] = LeafNode
+		byteorder.BigEndian.PutUint32(block[h.BlockSize-4:], uint32(maxptr))
+
+		off += copy(block[2:h.BlockSize-4], src[off:])
+
+		nptr = ptr
+	}
+
+	return node.self
+}
+
+type Key []byte
+
+type ByteArray = data_types.ByteArray
+
+type indexNode struct {
+	self   uint
+	height uint8
+	keys   []Key
+	ptrs   []uint
+}
+
+func (node *indexNode) find(key Key) (int, bool) {
+	keys := node.keys
+
+	index := sort.Search(len(keys), func(i int) bool { return bytes.Compare(keys[i], key) >= 0 })
+
+	if index < len(keys) && bytes.Equal(keys[index], key) {
+		return index, true
+	}
+
+	return index, false
+}
+
+func (node *indexNode) insertAtKey(index int, key Key) {
+	node.keys = append(node.keys, nil)
+	copy(node.keys[index+1:], node.keys[index:])
+	node.keys[index] = key
+}
+
+func (node *indexNode) insertAtPtr(index int, ptr uint) {
+	node.ptrs = append(node.ptrs, 0)
+	copy(node.ptrs[index+1:], node.ptrs[index:])
+	node.ptrs[index] = ptr
+}
+
+func (node *indexNode) replaceAtKey(index int, key Key) {
+	node.keys[index] = key
+}
+
+func (node *indexNode) replaceAtPtr(index int, ptr uint) {
+	node.ptrs[index] = ptr
+}
+
+func (node *indexNode) removeAtKey(index int) Key {
+	r1 := node.keys[index]
+	copy(node.keys[index:], node.keys[index+1:])
+	node.keys = node.keys[:len(node.keys)-1]
+	return r1
+}
+
+func (node *indexNode) removeAtPtr(index int) uint {
+	r2 := node.ptrs[index]
+	copy(node.ptrs[index:], node.ptrs[index+1:])
+	node.ptrs = node.ptrs[:len(node.ptrs)-1]
+	return r2
+}
+
+func (node *indexNode) split() (*indexNode, Key) {
+	i := (len(node.keys) + 1) / 2
+
+	r := &indexNode{self: maxptr, height: node.height}
+
+	r.keys = append(r.keys, node.keys[i+1:]...)
+	rkey := node.keys[i]
+	for t, k := i, len(node.keys); t < k; t++ {
+		node.keys[t] = nil
+	}
+	node.keys = node.keys[:i]
+
+	r.ptrs = append(r.ptrs, node.ptrs[i+1:]...)
+	node.ptrs = node.ptrs[:i+1]
+
+	return r, rkey
+}
+
+type leafNode struct {
+	self uint
+	keys []Key
+	data []ByteArray
+}
+
+func (node *leafNode) find(key Key) (int, bool) {
+	keys := node.keys
+
+	index := sort.Search(len(keys), func(i int) bool { return bytes.Compare(keys[i], key) >= 0 })
+
+	if index < len(keys) && bytes.Equal(keys[index], key) {
+		return index, true
+	}
+
+	return index, false
+}
+
+func (node *leafNode) replaceAt(index int, data ByteArray) {
+	node.data[index] = data
+}
+
+func (node *leafNode) insertAt(index int, key Key, data ByteArray) {
+	node.keys = append(node.keys, nil)
+	copy(node.keys[index+1:], node.keys[index:])
+	node.keys[index] = key
+
+	node.data = append(node.data, nil)
+	copy(node.data[index+1:], node.data[index:])
+	node.data[index] = data
+}
+
+func (node *leafNode) size() int {
+	size := 0
+	for k := range node.keys {
+		size += len(node.keys[k]) + byteorder.VMAXLEN + len(node.data[k])
+	}
+	return size
+}
+
+func (node *leafNode) removeAt(index int) (Key, ByteArray) {
+	r1 := node.keys[index]
+	copy(node.keys[index:], node.keys[index+1:])
+	node.keys = node.keys[:len(node.keys)-1]
+
+	r2 := node.data[index]
+	copy(node.data[index:], node.data[index+1:])
+	node.data = node.data[:len(node.data)-1]
+
+	return r1, r2
+}
+
+func (node *leafNode) split() *leafNode {
+	i := (len(node.keys) + 1) / 2
+
+	r := &leafNode{self: maxptr}
+
+	r.keys = append(r.keys, node.keys[i:]...)
+	for t, k := i, len(node.keys); t < k; t++ {
+		node.keys[t] = nil
+	}
+	node.keys = node.keys[:i]
+
+	r.data = append(r.data, node.data[i:]...)
+	for t, k := i, len(node.data); t < k; t++ {
+		node.data[t] = nil
+	}
+	node.data = node.data[:i]
+
+	return r
+}
+
+type freeNode struct {
+	next uint
+	ptrs []uint
+}
+
+func (h *BTreeDB5) getLeaf(ptr uint, key Key) ByteArray {
+	node := h.leafNode(ptr)
+	index, ok := node.find(key)
+	if ok {
+		return node.data[index]
+	} else {
+		return nil
+	}
+}
+
+func (h *BTreeDB5) getIndex(ptr uint, key Key) ByteArray {
+	node := h.indexNode(ptr)
+
+	index, ok := node.find(key)
+	if ok {
+		index = index + 1
+	}
+
+	if node.height == 0 {
+		return h.getLeaf(node.ptrs[index], key)
+	} else {
+		return h.getIndex(node.ptrs[index], key)
+	}
+}
+
+func (h *BTreeDB5) Get(key Key) (r ByteArray, e error) {
+	defer func() {
+		k := recover()
+		if k != nil {
+			e = errors.Errorf("%+v\n", k)
+		}
+	}()
+
+	if h.Tree.RootIsLeaf {
+		r = h.getLeaf(h.Tree.RootBlock, key)
+	} else {
+		r = h.getIndex(h.Tree.RootBlock, key)
+	}
+
+	if r == nil {
+		e = errors.New("not found")
 	}
 
 	return
 }
 
-func (h *BTreeDB5) wii(ptr int, inter ii) error {
-	j := len(inter.ptrs)
-
-	if j > h.order {
-		return errors.New("need a smaller index list")
-	}
-
-	typ, data, nptr := h.sector(ptr)
-
-	typ[0] = InterBlock
-	typ[1] = InterBlock
-
-	data[0] = byte(inter.height)
-	big.PutInt32(data[1:], int32(j))
-
-	off := 5
-
-	for k := range inter.keys {
-		big.PutInt32(data[off:], int32(inter.ptrs[k]))
-
-		off += copy(data[off+4:], inter.keys[k]) + 4
-	}
-
-	big.PutInt32(data[off:], int32(inter.ptrs[len(inter.ptrs)-1]))
-
-	big.PutInt32(nptr, 0)
-	return nil
+func (h *BTreeDB5) Has(key Key) (r bool, e error) {
+	var s ByteArray
+	s, e = h.Get(key)
+	return s != nil, e
 }
 
-func (h *BTreeDB5) wll(ptr int, records []Record) error {
-	if len(records) > h.order {
-		return errors.New("too many records")
+func (h *BTreeDB5) hetaLeaf(ptr uint, head bool) (Key, ByteArray) {
+	node := h.leafNode(ptr)
+	var index int
+	if head {
+		index = 0
+	} else {
+		index = len(node.keys) - 1
 	}
+	return node.keys[index], node.data[index]
+}
 
-	bufsz := 4
-	for _, v := range records {
-		bufsz += h.KeySize + 10 + len(v.Data)
+func (h *BTreeDB5) hetaIndex(ptr uint, head bool) (Key, ByteArray) {
+	node := h.indexNode(ptr)
+	var index int
+	if head {
+		index = 0
+	} else {
+		index = len(node.ptrs) - 1
 	}
-
-	buf := make([]byte, bufsz)
-
-	big.PutInt32(buf, int32(len(records)))
-	off := 4
-
-	for _, v := range records {
-		off += copy(buf[off:], v.Key)
-
-		off += big.PutUVarint(buf[off:], uint64(len(v.Data)))
-
-		off += copy(buf[off:], v.Data)
+	if node.height == 0 {
+		return h.hetaLeaf(node.ptrs[index], head)
+	} else {
+		return h.hetaIndex(node.ptrs[index], head)
 	}
+}
 
-	roff := 0
-	for {
-		typ, data, nptr := h.sector(ptr)
+func (h *BTreeDB5) first() (Key, ByteArray) {
+	if h.Tree.RootIsLeaf {
+		return h.hetaLeaf(h.Tree.RootBlock, true)
+	} else {
+		return h.hetaIndex(h.Tree.RootBlock, true)
+	}
+}
 
-		typ[0] = LeafBlock
-		typ[1] = LeafBlock
-
-		roff += copy(data, buf[roff:])
-
-		ptr = int(big.Int32(nptr))
-
-		if roff >= off {
-			big.PutInt32(nptr, -1)
-			h.freelist_push(ptr)
-			break
+func (h *BTreeDB5) First() (k Key, r ByteArray, e error) {
+	defer func() {
+		k := recover()
+		if k != nil {
+			e = errors.Errorf("%+v\n", k)
 		}
+	}()
 
-		if ptr == -1 {
-			var e error
-			ptr, e = h.freelist_pop()
-			if e != nil {
-				if !strings.HasSuffix(e.Error(), "remap") {
-					return e
-				}
+	k, r = h.first()
+	if r == nil {
+		e = errors.New("not found")
+	}
 
-				_, _, nptr = h.sector(ptr)
+	return
+}
+
+func (h *BTreeDB5) last() (Key, ByteArray) {
+	if h.Tree.RootIsLeaf {
+		return h.hetaLeaf(h.Tree.RootBlock, false)
+	} else {
+		return h.hetaIndex(h.Tree.RootBlock, false)
+	}
+}
+
+func (h *BTreeDB5) Last() (k Key, r ByteArray, e error) {
+	defer func() {
+		k := recover()
+		if k != nil {
+			e = errors.Errorf("%+v\n", k)
+		}
+	}()
+
+	k, r = h.last()
+	if r == nil {
+		e = errors.New("not found")
+	}
+
+	return
+}
+
+type Iterator func(Key, []byte)
+
+func (h *BTreeDB5) iterateLeaf(ptr uint, start, stop Key, dir direction, iter Iterator) bool {
+	var i int
+	var ok bool
+
+	node := h.leafNode(ptr)
+
+	switch dir {
+	case ascend:
+		if start != nil {
+			i, _ = node.find(start)
+		}
+		//else i = 0
+
+		for j := len(node.keys); i < j; i++ {
+			if stop != nil && bytes.Compare(node.keys[i], stop) >= 0 {
+				return true
 			}
 
-			big.PutInt32(nptr, int32(ptr))
+			iter(node.keys[i], node.data[i])
 		}
-	}
-
-	return nil
-}
-
-func (h *BTreeDB5) addii(inters []ii, ptrs []int, height int8, tokey Key, left_ptr, right_ptr int) error {
-	ptrs_len := len(ptrs)
-	origin_ptr := ptrs_len - 1
-
-	// only happens when root is a leaf
-	if ptrs_len == 0 || inters[origin_ptr].height == -1 {
-		newroot, e := h.freelist_pop()
-		if e != nil && !strings.HasSuffix(e.Error(), "remap") {
-			return e
-		}
-
-		if e := h.wii(newroot, ii{
-			height: height,
-			keys: []Key{
-				tokey,
-			},
-			ptrs: []int{
-				left_ptr,
-				right_ptr,
-			},
-		}); e != nil {
-			return e
-		}
-
-		h.setRoot(newroot)
-		return nil
-	}
-
-	orilen := len(inters[origin_ptr].keys)
-
-	n := sort.Search(orilen, func(i int) bool {
-		return tokey.Less(inters[origin_ptr].keys[i])
-	})
-
-	inters[origin_ptr].keys = append(inters[origin_ptr].keys[:n], append([]Key{tokey}, inters[origin_ptr].keys[n:]...)...)
-	inters[origin_ptr].ptrs = append(inters[origin_ptr].ptrs[:n], append([]int{left_ptr}, inters[origin_ptr].ptrs[n:]...)...)
-	inters[origin_ptr].ptrs[n+1] = right_ptr
-
-	// no need to split keys
-	if orilen+2 <= h.order {
-		inters[origin_ptr].height = height
-		return h.wii(inters[origin_ptr].ptr, inters[origin_ptr])
-	}
-
-	middle := (orilen + 1) >> 1
-
-	low := inters[origin_ptr]
-	low.keys = low.keys[:middle]
-	low.ptrs = low.ptrs[:middle+1]
-	low.height = height
-	e := h.wii(low.ptr, low)
-	if e != nil {
-		return e
-	}
-
-	high := inters[origin_ptr]
-	high.keys = high.keys[middle+1:]
-	high.ptrs = high.ptrs[middle+1:]
-	high.height = height
-	high.ptr, e = h.freelist_pop()
-	if e != nil && !strings.HasSuffix(e.Error(), "remap") {
-		return e
-	}
-
-	if e := h.wii(high.ptr, high); e != nil {
-		return e
-	}
-
-	if origin_ptr > 0 {
-		return h.addii(inters[:origin_ptr], ptrs[:origin_ptr], height+1, high.keys[0], low.ptr, high.ptr)
-	} else {
-		return h.addii(nil, nil, height+1, high.keys[0], low.ptr, high.ptr)
-	}
-}
-
-func (h *BTreeDB5) rmii(inters []ii, ptrs []int, mayberoot int, height int, left bool) error {
-	var e error
-
-	ptrs_len := len(ptrs)
-	origin_ptr := ptrs_len - 1
-	parent_ptr := ptrs_len - 2
-
-	toptr := ptrs[ptrs_len-1]
-
-	oriklen := len(inters[origin_ptr].keys)
-	oriplen := len(inters[origin_ptr].ptrs)
-
-	if left {
-		if toptr == 0 {
-			return errors.New("remove the left side of firstone?")
-		}
-
-		if toptr < oriklen {
-			copy(inters[origin_ptr].keys[toptr-1:], inters[origin_ptr].keys[toptr:])
-		}
-		inters[origin_ptr].keys = inters[origin_ptr].keys[:oriklen-1]
-
-		if toptr < oriplen {
-			copy(inters[origin_ptr].ptrs[toptr-1:], inters[origin_ptr].ptrs[toptr:])
-		}
-		inters[origin_ptr].ptrs = inters[origin_ptr].ptrs[:oriplen-1]
-	} else {
-		if toptr == oriklen+1 {
-			return errors.New("remove the right side of lastone?")
-		}
-
-		if toptr+1 < oriklen {
-			copy(inters[origin_ptr].keys[toptr:], inters[origin_ptr].keys[toptr+1:])
-		}
-		inters[origin_ptr].keys = inters[origin_ptr].keys[:oriklen-1]
-
-		if toptr+2 < oriplen {
-			copy(inters[origin_ptr].ptrs[toptr+1:], inters[origin_ptr].ptrs[toptr+2:])
-		}
-		inters[origin_ptr].ptrs = inters[origin_ptr].ptrs[:oriplen-1]
-	}
-
-	// oriklen = oriplen - 1
-	if oriklen > h.order/2 {
-		if e := h.wii(inters[origin_ptr].ptr, inters[origin_ptr]); e != nil {
-			return e
-		}
-
-		return nil
-	}
-
-	if ptrs_len == 1 {
-		// this should be the root node
-		if oriklen < 2 {
-			// and it's too smal
-			// so it is to be destroyed
-			h.freelist_push(inters[origin_ptr].ptr)
-			h.setRoot(inters[origin_ptr].ptrs[toptr])
-			return nil
+	case descend:
+		if start != nil {
+			i, ok = node.find(start)
+			if !ok {
+				i = i - 1
+			}
 		} else {
-			if e := h.wii(inters[origin_ptr].ptr, inters[origin_ptr]); e != nil {
-				return e
+			i = len(node.keys) - 1
+		}
+
+		for ; i > -1; i-- {
+			if stop != nil && bytes.Compare(node.keys[i], stop) < 0 {
+				return true
 			}
 
-			return nil
+			iter(node.keys[i], node.data[i])
 		}
 	}
 
-	sib_side := 0
-	sib := ii{}
-
-	if ptrs[ptrs_len-2]+1 < len(inters[parent_ptr].ptrs) {
-		sib_side = 2
-
-		sib, e = h.blk(inters[parent_ptr].ptrs[ptrs[ptrs_len-2]+1])
-		if e != nil {
-			return e
-		}
-
-		sib_oriplen := len(sib.ptrs)
-		if sib_oriplen > h.order/2 {
-			inters[origin_ptr].keys = inters[origin_ptr].keys[:oriklen]
-			inters[origin_ptr].keys[oriklen-1], sib.keys = sib.keys[0], sib.keys[1:]
-
-			inters[origin_ptr].ptrs = inters[origin_ptr].ptrs[:oriplen]
-			inters[origin_ptr].ptrs[oriplen-1], sib.ptrs = sib.ptrs[0], sib.ptrs[1:]
-
-			if e := h.wii(sib.ptr, sib); e != nil {
-				return e
-			}
-
-			if e := h.wii(inters[origin_ptr].ptr, inters[origin_ptr]); e != nil {
-				return e
-			}
-
-			inters[parent_ptr].keys[ptrs[ptrs_len-2]] = sib.keys[0]
-
-			return h.wii(inters[parent_ptr].ptr, inters[parent_ptr])
-		}
-	}
-
-	if sib_side == 0 && ptrs[ptrs_len-2] > 0 {
-		sib_side = 1
-
-		sib, e = h.blk(inters[parent_ptr].ptrs[ptrs[ptrs_len-2]-1])
-		if e != nil {
-			return e
-		}
-
-		sib_oriklen := len(sib.keys)
-		sib_oriplen := len(sib.ptrs)
-		if sib_oriplen > h.order/2 {
-			inters[origin_ptr].keys = inters[origin_ptr].keys[:oriklen]
-			inters[origin_ptr].keys = append([]Key{Key{}}, inters[origin_ptr].keys...)
-			inters[origin_ptr].keys[0], sib.keys = sib.keys[sib_oriklen-1], sib.keys[:sib_oriklen-1]
-
-			inters[origin_ptr].ptrs = inters[origin_ptr].ptrs[:oriplen]
-			inters[origin_ptr].ptrs = append([]int{0}, inters[origin_ptr].ptrs...)
-			inters[origin_ptr].ptrs[0], sib.ptrs = sib.ptrs[sib_oriplen-1], sib.ptrs[:sib_oriplen-1]
-
-			if e := h.wii(sib.ptr, sib); e != nil {
-				return e
-			}
-
-			if e := h.wii(inters[origin_ptr].ptr, inters[origin_ptr]); e != nil {
-				return e
-			}
-
-			inters[parent_ptr].keys[ptrs[ptrs_len-2]-1] = inters[origin_ptr].keys[0]
-
-			return h.wii(inters[parent_ptr].ptr, inters[parent_ptr])
-		}
-	}
-
-	if sib_side == 1 {
-		sib.keys = append(sib.keys, inters[parent_ptr].keys[ptrs[ptrs_len-2]-1])
-		sib.keys = append(sib.keys, inters[origin_ptr].keys...)
-		sib.ptrs = append(sib.ptrs, inters[origin_ptr].ptrs...)
-
-		if e := h.wii(sib.ptr, sib); e != nil {
-			return e
-		}
-
-		h.freelist_push(inters[origin_ptr].ptr)
-
-		return h.rmii(inters[:origin_ptr], ptrs[:origin_ptr], sib.ptr, height+1, true)
-	} else if sib_side == 2 {
-		inters[origin_ptr].keys = append(inters[origin_ptr].keys, inters[parent_ptr].keys[ptrs[ptrs_len-2]])
-		inters[origin_ptr].keys = append(inters[origin_ptr].keys, sib.keys...)
-		inters[origin_ptr].ptrs = append(inters[origin_ptr].ptrs, sib.ptrs...)
-
-		if e := h.wii(inters[origin_ptr].ptr, inters[origin_ptr]); e != nil {
-			return e
-		}
-
-		h.freelist_push(sib.ptr)
-
-		return h.rmii(inters[:origin_ptr], ptrs[:origin_ptr], inters[origin_ptr].ptr, height+1, false)
-	} else {
-		return errors.New("not enough nodes to merge, tree corrupted")
-	}
+	return false
 }
 
-func (h *BTreeDB5) traverse(ptr int, f func(Record) error) error {
-	inter, e := h.blk(ptr)
-	if e != nil {
-		return e
+func (h *BTreeDB5) iterateIndex(ptr uint, start, stop Key, dir direction, iter Iterator) bool {
+	var i int
+	var ok bool
+
+	node := h.indexNode(ptr)
+
+	switch dir {
+	case ascend:
+		if start != nil {
+			i, ok = node.find(start)
+			if ok {
+				i = i + 1
+			}
+		}
+		//else i = 0
+
+		for j := len(node.ptrs); i < j; i++ {
+			if node.height == 0 {
+				if h.iterateLeaf(node.ptrs[i], start, stop, dir, iter) {
+					return true
+				}
+			} else {
+				if h.iterateIndex(node.ptrs[i], start, stop, dir, iter) {
+					return true
+				}
+			}
+		}
+	case descend:
+		if start != nil {
+			i, ok = node.find(start)
+			if !ok {
+				i = i - 1
+			}
+		} else {
+			i = len(node.ptrs) - 1
+		}
+
+		for ; i > -1; i-- {
+			if node.height == 0 {
+				if h.iterateLeaf(node.ptrs[i], start, stop, dir, iter) {
+					return true
+				}
+			} else {
+				if h.iterateIndex(node.ptrs[i], start, stop, dir, iter) {
+					return true
+				}
+			}
+		}
 	}
 
-	if inter.height != -1 {
-		for _, v := range inter.ptrs {
-			if e := h.traverse(v, f); e != nil {
-				return e
-			}
+	return false
+}
+
+func (h *BTreeDB5) Ascend(iter Iterator) (e error) {
+	defer func() {
+		k := recover()
+		if k != nil {
+			e = errors.Errorf("%+v\n", k)
 		}
+	}()
+
+	if h.Tree.RootIsLeaf {
+		h.iterateLeaf(h.Tree.RootBlock, nil, nil, ascend, iter)
 	} else {
-		records := inter.records
-		for k := range records {
-			if e := f(records[k]); e != nil {
-				return e
-			}
+		h.iterateIndex(h.Tree.RootBlock, nil, nil, ascend, iter)
+	}
+	return
+}
+
+func (h *BTreeDB5) AscendRange(start, stop Key, iter Iterator) (e error) {
+	defer func() {
+		k := recover()
+		if k != nil {
+			e = errors.Errorf("%+v\n", k)
 		}
+	}()
+
+	if h.Tree.RootIsLeaf {
+		h.iterateLeaf(h.Tree.RootBlock, start, stop, ascend, iter)
+	} else {
+		h.iterateIndex(h.Tree.RootBlock, start, stop, ascend, iter)
+	}
+	return
+}
+
+func (h *BTreeDB5) Descend(iter Iterator) (e error) {
+	defer func() {
+		k := recover()
+		if k != nil {
+			e = errors.Errorf("%+v\n", k)
+		}
+	}()
+
+	if h.Tree.RootIsLeaf {
+		h.iterateLeaf(h.Tree.RootBlock, nil, nil, descend, iter)
+	} else {
+		h.iterateIndex(h.Tree.RootBlock, nil, nil, descend, iter)
+	}
+	return
+}
+
+func (h *BTreeDB5) DescendRange(start, stop Key, iter Iterator) (e error) {
+	defer func() {
+		k := recover()
+		if k != nil {
+			e = errors.Errorf("%+v\n", k)
+		}
+	}()
+
+	if h.Tree.RootIsLeaf {
+		h.iterateLeaf(h.Tree.RootBlock, start, stop, descend, iter)
+	} else {
+		h.iterateIndex(h.Tree.RootBlock, start, stop, descend, iter)
+	}
+	return
+}
+
+func (h *BTreeDB5) insertLeaf(ptr uint, key Key, data ByteArray) (uint, uint, Key) {
+	node := h.leafNode(ptr)
+
+	index, ok := node.find(key)
+
+	if ok {
+		node.replaceAt(index, data)
+	} else {
+		node.insertAt(index, key, data)
+	}
+
+	size := 0
+	for k := range node.keys {
+		size += h.KeySize + byteorder.VMAXLEN + len(node.data[k])
+	}
+
+	if 2*(h.BlockSize-6) > size || len(node.keys) == 1 {
+		return h.writeLeafNode(node), maxptr, nil
+	}
+
+	newnode := node.split()
+	return h.writeLeafNode(node), h.writeLeafNode(newnode), newnode.keys[0]
+}
+
+func (h *BTreeDB5) insertIndex(ptr uint, key Key, data ByteArray) (uint, uint, Key, uint8) {
+	node := h.indexNode(ptr)
+
+	index, ok := node.find(key)
+	if ok {
+		index = index + 1
+	}
+
+	var l, r uint
+	var rkey Key
+
+	if node.height == 0 {
+		l, r, rkey = h.insertLeaf(node.ptrs[index], key, data)
+	} else {
+		l, r, rkey, _ = h.insertIndex(node.ptrs[index], key, data)
+	}
+
+	node.replaceAtPtr(index, l)
+
+	if rkey == nil {
+		return h.writeIndexNode(node), maxptr, nil, node.height
+	}
+
+	node.insertAtKey(index, rkey)
+	node.insertAtPtr(index+1, r)
+
+	if len(node.ptrs) <= h.intermax {
+		return h.writeIndexNode(node), maxptr, nil, node.height
+	}
+
+	newnode, rkey := node.split()
+	return h.writeIndexNode(node), h.writeIndexNode(newnode), rkey, node.height
+}
+
+func (h *BTreeDB5) Insert(key Key, data ByteArray) (e error) {
+	defer func() {
+		k := recover()
+		if k != nil {
+			e = errors.Errorf("%+v\n", k)
+		}
+	}()
+
+	var l, r uint
+	var o uint8 = 255
+	var rkey Key
+
+	if h.Tree.RootIsLeaf {
+		l, r, rkey = h.insertLeaf(h.Tree.RootBlock, key, data)
+	} else {
+		l, r, rkey, o = h.insertIndex(h.Tree.RootBlock, key, data)
+	}
+
+	h.Tree.RootBlock = l
+
+	if rkey != nil {
+		node := &indexNode{self: maxptr, height: o + 1}
+		node.keys = append(node.keys, rkey)
+		node.ptrs = append(node.ptrs, l, r)
+
+		h.Tree.RootBlock = h.writeIndexNode(node)
+		h.Tree.RootIsLeaf = false
 	}
 
 	return nil
 }
 
-func (h *BTreeDB5) Find(key Key, f func(Record) error) error {
-	h.rwmu.RLock()
-	defer h.rwmu.RUnlock()
+func (h *BTreeDB5) removeLeaf(ptr uint, key Key) *leafNode {
+	node := h.leafNode(ptr)
 
-	root := h.getRoot()
+	index, ok := node.find(key)
 
-	inter, e := h.blk(root)
-	if e != nil {
-		return e
+	if ok {
+		node.removeAt(index)
 	}
 
-	for inter.height != -1 {
-		inter, e = h.blk(inter.ptrs[sort.Search(len(inter.keys), func(i int) bool {
-			return key.Less(inter.keys[i])
-		})])
+	return node
+}
 
-		if e != nil {
-			return e
-		}
+func (h *BTreeDB5) removeIndex(ptr uint, key Key) *indexNode {
+	node := h.indexNode(ptr)
+
+	index, ok := node.find(key)
+
+	if ok {
+		index = index + 1
 	}
 
-	records := inter.records
+	if node.height == 0 {
+		mnode := h.removeLeaf(node.ptrs[index], key)
 
-	n := sort.Search(len(records), func(i int) bool {
-		return key.Less(records[i].Key)
-	})
-
-	if n > 0 && !records[n-1].Key.Less(key) {
-		if e := f(records[n-1]); e != nil {
-			return e
+		if (h.BlockSize - 6) > mnode.size() {
+			if index > 0 {
+				lnode := h.leafNode(node.ptrs[index-1])
+				if (h.BlockSize - 6) < lnode.size() {
+					rkey, rdata := lnode.removeAt(len(lnode.keys) - 1)
+					mnode.insertAt(0, rkey, rdata)
+					node.replaceAtKey(index-1, rkey)
+					node.replaceAtPtr(index-1, h.writeLeafNode(lnode))
+					node.replaceAtPtr(index, h.writeLeafNode(mnode))
+				} else {
+					mnode.keys = append(lnode.keys, mnode.keys...)
+					mnode.data = append(lnode.data, mnode.data...)
+					node.replaceAtPtr(index, h.writeLeafNode(mnode))
+					node.removeAtKey(index - 1)
+					node.removeAtPtr(index - 1)
+					h.freelist_push(lnode.self)
+				}
+			} else if index+1 < len(node.ptrs) {
+				rnode := h.leafNode(node.ptrs[index+1])
+				if (h.BlockSize - 6) < rnode.size() {
+					rkey, rdata := rnode.removeAt(0)
+					mnode.insertAt(len(mnode.keys), rkey, rdata)
+					node.replaceAtKey(index, rkey)
+					node.replaceAtPtr(index+1, h.writeLeafNode(rnode))
+					node.replaceAtPtr(index, h.writeLeafNode(mnode))
+				} else {
+					mnode.keys = append(mnode.keys, rnode.keys...)
+					mnode.data = append(mnode.data, rnode.data...)
+					node.replaceAtPtr(index, h.writeLeafNode(mnode))
+					node.removeAtKey(index)
+					node.removeAtPtr(index + 1)
+					h.freelist_push(rnode.self)
+				}
+			}
+			// no more siblings
 		}
 	} else {
-		return errors.New("not found")
+		mnode := h.removeIndex(node.ptrs[index], key)
+		node.height = mnode.height + 1
+
+		if len(mnode.ptrs) <= (h.freemax+1)/2 {
+			if index > 0 {
+				lnode := h.indexNode(node.ptrs[index-1])
+				if len(lnode.ptrs) > (h.freemax+1)/2 {
+					mnode.insertAtPtr(0, lnode.removeAtPtr(len(lnode.ptrs)-1))
+					mnode.insertAtKey(0, node.keys[index-1])
+					node.replaceAtKey(index-1, lnode.removeAtKey(len(lnode.keys)-1))
+					node.replaceAtPtr(index-1, h.writeIndexNode(lnode))
+					node.replaceAtPtr(index, h.writeIndexNode(mnode))
+				} else {
+					lnode.keys = append(lnode.keys, node.keys[index-1])
+					mnode.keys = append(lnode.keys, mnode.keys...)
+					mnode.ptrs = append(lnode.ptrs, mnode.ptrs...)
+					node.replaceAtPtr(index, h.writeIndexNode(mnode))
+					node.removeAtKey(index - 1)
+					node.removeAtPtr(index - 1)
+					h.freelist_push(lnode.self)
+				}
+			} else if index+1 < len(node.ptrs) {
+				rnode := h.indexNode(node.ptrs[index+1])
+				if len(rnode.ptrs) > (h.freemax+1)/2 {
+					mnode.insertAtPtr(len(mnode.ptrs), rnode.removeAtPtr(0))
+					mnode.insertAtKey(len(mnode.keys), node.keys[index])
+					node.replaceAtKey(index, rnode.removeAtKey(0))
+					node.replaceAtPtr(index, h.writeIndexNode(mnode))
+					node.replaceAtPtr(index+1, h.writeIndexNode(rnode))
+				} else {
+					mnode.keys = append(mnode.keys, node.keys[index])
+					mnode.keys = append(mnode.keys, rnode.keys...)
+					mnode.ptrs = append(mnode.ptrs, rnode.ptrs...)
+					node.replaceAtPtr(index, h.writeIndexNode(mnode))
+					node.removeAtKey(index)
+					node.removeAtPtr(index + 1)
+					h.freelist_push(rnode.self)
+				}
+			} else {
+				// no more siblings
+				h.freelist_push(node.self)
+				return mnode
+			}
+		}
 	}
 
-	return nil
+	return node
 }
 
-func (h *BTreeDB5) First(f func(Record) error) error {
-	h.rwmu.RLock()
-	defer h.rwmu.RUnlock()
-
-	root := h.getRoot()
-
-	inter, e := h.blk(root)
-	if e != nil {
-		return e
-	}
-
-	for inter.height != -1 {
-		inter, e = h.blk(inter.ptrs[0])
-		if e != nil {
-			return e
+func (h *BTreeDB5) Remove(key Key) (e error) {
+	defer func() {
+		k := recover()
+		if k != nil {
+			e = errors.Errorf("%+v\n", k)
 		}
-	}
+	}()
 
-	if e := f(inter.records[0]); e != nil {
-		return e
-	}
-
-	return nil
-}
-
-func (h *BTreeDB5) Last(f func(Record) error) error {
-	h.rwmu.RLock()
-	defer h.rwmu.RUnlock()
-
-	root := h.getRoot()
-
-	inter, e := h.blk(root)
-	if e != nil {
-		return e
-	}
-
-	for inter.height != -1 {
-		inter, e = h.blk(inter.ptrs[len(inter.ptrs)-1])
-		if e != nil {
-			return e
-		}
-	}
-
-	if e := f(inter.records[len(inter.records)-1]); e != nil {
-		return e
-	}
-
-	return nil
-}
-
-func (h *BTreeDB5) Traverse(f func(Record) error) error {
-	h.rwmu.RLock()
-	defer h.rwmu.RUnlock()
-
-	return h.traverse(h.getRoot(), f)
-}
-
-func (h *BTreeDB5) Insert(key Key, data []byte) error {
-	h.rwmu.Lock()
-	defer h.rwmu.Unlock()
-
-	root := h.getRoot()
-
-	inter, e := h.blk(root)
-	if e != nil {
-		return e
-	}
-
-	inters := []ii{}
-	ptrs := []int{}
-	for inter.height != -1 {
-		inters = append(inters, inter)
-
-		j := sort.Search(len(inter.keys), func(i int) bool {
-			return key.Less(inter.keys[i])
-		})
-
-		ptrs = append(ptrs, j)
-
-		inter, e = h.blk(inter.ptrs[j])
-		if e != nil {
-			return e
-		}
-	}
-
-	records := inter.records
-	orilen := len(records)
-
-	n := sort.Search(orilen, func(i int) bool {
-		return key.Less(records[i].Key)
-	})
-
-	if n > 0 && !records[n-1].Key.Less(key) {
-		records[n-1].Data = data
-		if e := h.wll(inter.ptr, records); e != nil {
-			return e
-		}
-
-		return nil
-	}
-
-	records = append(records[:n], append([]Record{Record{Key: key, Data: data}}, records[n:]...)...)
-
-	if orilen+1 <= h.order {
-		if e := h.wll(inter.ptr, records); e != nil {
-			return e
-		}
-
-		return nil
-	}
-
-	h.freelist_push(inter.ptr)
-
-	middle := (orilen + 1) >> 1
-
-	left_ptr, e := h.freelist_pop()
-	if e != nil && !strings.HasSuffix(e.Error(), "remap") {
-		return e
-	}
-
-	if e := h.wll(left_ptr, records[:middle]); e != nil {
-		return e
-	}
-
-	right_ptr, e := h.freelist_pop()
-	if e != nil && !strings.HasSuffix(e.Error(), "remap") {
-		return e
-	}
-
-	if e := h.wll(right_ptr, records[middle:]); e != nil {
-		return e
-	}
-
-	if e := h.addii(inters, ptrs, 0, records[middle].Key, left_ptr, right_ptr); e != nil {
-		return e
-	}
-
-	return nil
-}
-
-func (h *BTreeDB5) Delete(key Key) error {
-	h.rwmu.Lock()
-	defer h.rwmu.Unlock()
-
-	root := h.getRoot()
-
-	inter, e := h.blk(root)
-	if e != nil {
-		return e
-	}
-
-	inters := []ii{}
-	ptrs := []int{}
-	for inter.height != -1 {
-		inters = append(inters, inter)
-
-		j := sort.Search(len(inter.keys), func(i int) bool {
-			return key.Less(inter.keys[i])
-		})
-
-		ptrs = append(ptrs, j)
-
-		inter, e = h.blk(inter.ptrs[j])
-		if e != nil {
-			return e
-		}
-	}
-	ptrs_len := len(ptrs)
-	parent_ptr := ptrs_len - 1
-
-	records := inter.records
-	orilen := len(records)
-
-	n := sort.Search(orilen, func(i int) bool {
-		return key.Less(records[i].Key)
-	})
-
-	if n > 0 && !records[n-1].Key.Less(key) {
-		copy(records[n-1:], records[n:])
-		records = records[:orilen-1]
+	if h.Tree.RootIsLeaf {
+		lnode := h.removeLeaf(h.Tree.RootBlock, key)
+		h.Tree.RootBlock = h.writeLeafNode(lnode)
 	} else {
-		return errors.New("not found")
-	}
-
-	// orilen-1 >= h.order/2
-	if orilen > h.order/2 {
-		if e := h.wll(inter.ptr, records); e != nil {
-			return e
-		}
-
-		return nil
-	}
-
-	// only happens when root is a leaf
-	if ptrs_len == 0 {
-		if orilen == 1 {
-			return errors.New("can not remove the lastkey")
-		}
-
-		if e := h.wll(inter.ptr, records); e != nil {
-			return e
-		}
-
-		return nil
-	}
-
-	sib_side := 0
-	sib := ii{}
-	sib_records := ([]Record)(nil)
-
-	if ptrs[parent_ptr]+1 < len(inters[parent_ptr].ptrs) {
-		sib_side = 2
-
-		sib, e = h.blk(inters[parent_ptr].ptrs[ptrs[parent_ptr]+1])
-		if e != nil {
-			return e
-		}
-
-		sib_records = sib.records
-		sib_orilen := len(sib_records)
-
-		if sib_orilen > h.order/2 {
-			records = records[:orilen]
-			records[orilen-1], sib_records = sib_records[0], sib_records[1:]
-
-			if e := h.wll(inter.ptr, records); e != nil {
-				return e
+		rnode := h.removeIndex(h.Tree.RootBlock, key)
+		if len(rnode.ptrs) > 1 {
+			h.Tree.RootBlock = h.writeIndexNode(rnode)
+		} else {
+			h.freelist_push(rnode.self)
+			h.Tree.RootBlock = rnode.ptrs[0]
+			if rnode.height == 0 {
+				h.Tree.RootIsLeaf = true
 			}
-
-			if e := h.wll(sib.ptr, sib_records); e != nil {
-				return e
-			}
-
-			inters[parent_ptr].keys[ptrs[parent_ptr]] = sib_records[0].Key
-
-			return h.wii(inters[parent_ptr].ptr, inters[parent_ptr])
 		}
 	}
 
-	if sib_side == 0 && ptrs[parent_ptr] > 0 {
-		sib_side = 1
-
-		sib, e = h.blk(inters[parent_ptr].ptrs[ptrs[parent_ptr]-1])
-		if e != nil {
-			return e
-		}
-
-		sib_records = sib.records
-		sib_orilen := len(sib_records)
-
-		if sib_orilen > h.order/2 {
-			records = records[:orilen]
-			records = append([]Record{Record{}}, records...)
-			records[0], sib_records = sib_records[sib_orilen-1], sib_records[:sib_orilen-1]
-
-			if e := h.wll(sib.ptr, sib_records); e != nil {
-				return e
-			}
-
-			if e := h.wll(inter.ptr, records); e != nil {
-				return e
-			}
-
-			inters[parent_ptr].keys[ptrs[parent_ptr]-1] = records[0].Key
-
-			return h.wii(inters[parent_ptr].ptr, inters[parent_ptr])
-		}
-	}
-
-	if sib_side == 1 {
-		sib_records = append(sib_records, records...)
-
-		if e := h.wll(sib.ptr, sib_records); e != nil {
-			return e
-		}
-
-		h.freelist_push(inter.ptr)
-
-		return h.rmii(inters, ptrs, inter.ptr, 0, true)
-	} else if sib_side == 2 {
-		records = append(records, sib_records...)
-
-		if e := h.wll(inter.ptr, records); e != nil {
-			return e
-		}
-
-		h.freelist_push(sib.ptr)
-
-		return h.rmii(inters, ptrs, inter.ptr, 0, false)
-	} else {
-		return errors.New("not enough nodes to merge, tree corrupted")
-	}
+	return nil
 }

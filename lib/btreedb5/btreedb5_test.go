@@ -1,12 +1,8 @@
 package btreedb5
 
-import (
-	"fmt"
-	"testing"
-)
-
+/*
 func TestApi(b *testing.T) {
-	h, e := New("test2", "fuck", 512, 5, DefaultBlocks)
+	h, e := New("test2", "fuck", 512, 5)
 	if e != nil {
 		b.Fatal(e)
 	}
@@ -43,3 +39,4 @@ func TestApi(b *testing.T) {
 		}
 	}
 }
+*/

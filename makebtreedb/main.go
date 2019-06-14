@@ -5,26 +5,43 @@ import (
 	"compress/zlib"
 	"encoding/hex"
 	"flag"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 
-	"../lib/btreedb5"
+	"github.com/xhebox/sbutils/lib/btreedb5"
 )
+
+func Exists(name string) bool {
+	_, err := os.Stat(name)
+	return !os.IsNotExist(err)
+}
 
 func main() {
 	var in, dir string
+	var root bool
 	flag.StringVar(&in, "i", "input", "db file")
 	flag.StringVar(&dir, "d", "dir", "records dir")
+	flag.BoolVar(&root, "r", false, "root")
 	flag.Parse()
 	log.SetFlags(log.Llongfile)
 
-	h, e := btreedb5.Load(in)
-	if e != nil {
-		log.Fatalln(e)
+	var h *btreedb5.BTreeDB5
+	var e error
+	//if Exists(in) {
+	if false {
+		h, e = btreedb5.Load(in)
+		if e != nil {
+			log.Fatalln(e)
+		}
+	} else {
+		h, e = btreedb5.New(in, "World4", 2048, 5)
+		if e != nil {
+			log.Fatalln(e)
+		}
 	}
 	defer h.Close()
 
@@ -32,6 +49,8 @@ func main() {
 	if e != nil {
 		log.Fatalln(e)
 	}
+
+	keys := [][]byte{}
 
 	for _, v := range files {
 		fname := v.Name()
@@ -42,7 +61,10 @@ func main() {
 		}
 
 		buf := &bytes.Buffer{}
-		zw := zlib.NewWriter(buf)
+		zw, e := zlib.NewWriterLevel(buf, zlib.BestCompression)
+		if e != nil {
+			log.Fatalln(e)
+		}
 
 		if _, e := io.Copy(zw, f); e != nil {
 			log.Fatalln(e)
@@ -51,13 +73,7 @@ func main() {
 		zw.Close()
 		f.Close()
 
-		tree1 := strings.HasPrefix(fname, "tree1")
-		keyhex := fname[6:]
-		if tree1 {
-			h.SetTree(1)
-		} else {
-			h.SetTree(2)
-		}
+		keyhex := fname[5:]
 
 		key, e := hex.DecodeString(keyhex)
 		if e != nil {
@@ -68,6 +84,24 @@ func main() {
 			log.Fatalf("key size is not %d\n", h.KeySize)
 		}
 
-		h.Insert(key, buf.Bytes())
+		keys = append(keys, key)
+
+		e = h.Insert(key, buf.Bytes())
+		if e != nil {
+			log.Fatalf("%+v\n", e)
+		}
+
+		h.Commit()
+	}
+
+	le := len(keys) - 1
+	for k := range keys {
+		fmt.Println("remove:", keys[le-k])
+		e = h.Remove(keys[le-k])
+		if e != nil {
+			log.Fatalf("%+v\n", e)
+		}
+
+		h.Commit()
 	}
 }

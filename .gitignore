@@ -4,4 +4,7 @@ makesbvj01/makesbvj01
 dumpsbvj01/dumpsbvj01
 dumpbtreedb/dumpbtreedb
 makebtreedb/makebtreedb
+test
 */*.exe
+*.world
+world*
