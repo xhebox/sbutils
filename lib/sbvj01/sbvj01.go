@@ -3,6 +3,7 @@ package sbvj01
 import (
 	"encoding/json"
 	"io"
+	"math"
 
 	"github.com/pkg/errors"
 	"github.com/xhebox/bstruct/byteorder"
@@ -24,9 +25,9 @@ const (
 )
 
 type VerJsonHdr struct {
-	Id      String `json:"id"`
-	Endian  byteorder.ByteOrder
-	Version int32 `json:"version"`
+	Id        String `json:"id"`
+	Versioned bool   `json:"versioned"`
+	Version   int32  `json:"version"`
 }
 
 func ReadHdr(rd io.Reader) (r VerJsonHdr, e error) {
@@ -35,22 +36,16 @@ func ReadHdr(rd io.Reader) (r VerJsonHdr, e error) {
 		return
 	}
 
-	var end byte
-
-	end, e = byteorder.Uint8(rd)
+	r.Versioned, e = byteorder.Bool(rd)
 	if e != nil {
 		return
 	}
 
-	if end == 0 {
-		r.Endian = byteorder.BigEndian
-	} else {
-		r.Endian = byteorder.LittleEndian
-	}
-
-	r.Version, e = byteorder.Int32(rd, r.Endian)
-	if e != nil {
-		return
+	if r.Versioned {
+		r.Version, e = byteorder.Int32(rd, byteorder.BigEndian)
+		if e != nil {
+			return
+		}
 	}
 
 	return
@@ -59,22 +54,24 @@ func ReadHdr(rd io.Reader) (r VerJsonHdr, e error) {
 func WriteHdr(wt io.Writer, r VerJsonHdr) error {
 	strlen := len(r.Id)
 
-	if e := byteorder.PutUVarint(wt, r.Endian, uint64(strlen)); e != nil {
+	if e := byteorder.PutUVarint(wt, byteorder.BigEndian, uint64(strlen)); e != nil {
 		return e
 	}
 
-	if e := byteorder.PutBool(wt, r.Endian == byteorder.LittleEndian); e != nil {
+	if e := byteorder.PutBool(wt, r.Versioned); e != nil {
 		return e
 	}
 
-	if e := byteorder.PutInt32(wt, r.Endian, int32(r.Version)); e != nil {
-		return e
+	if r.Versioned {
+		if e := byteorder.PutInt32(wt, byteorder.BigEndian, int32(r.Version)); e != nil {
+			return e
+		}
 	}
 
 	return nil
 }
 
-func Read(rd io.Reader, endian byteorder.ByteOrder) (interface{}, error) {
+func Read(rd io.Reader) (interface{}, error) {
 	typ, e := byteorder.Uint8(rd)
 	if e != nil {
 		return nil, e
@@ -84,24 +81,32 @@ func Read(rd io.Reader, endian byteorder.ByteOrder) (interface{}, error) {
 	case NullT:
 		return nil, nil
 	case NumberT:
-		return byteorder.Float64(rd, endian)
+		r, e := byteorder.Float64(rd, byteorder.BigEndian)
+		if math.IsNaN(r) {
+			return "____NaN____", e
+		} else if math.IsInf(r, 1) {
+			return "____+Inf____", e
+		} else if math.IsInf(r, -1) {
+			return "____-Inf____", e
+		}
+		return r, e
 	case BoolT:
 		return byteorder.Bool(rd)
 	case VarintT:
-		return byteorder.Varint(rd, endian)
+		return byteorder.Varint(rd, byteorder.BigEndian)
 	case StringT:
-		return ReadString(rd, endian)
+		return ReadString(rd, byteorder.BigEndian)
 	case ArrayT:
-		return ReadArray(rd, endian)
+		return ReadArray(rd)
 	case ObjectT:
-		return ReadObject(rd, endian)
+		return ReadObject(rd)
 	default:
 		return nil, errors.Errorf("unknown type %d", typ)
 	}
 }
 
-func ReadArray(rd io.Reader, endian byteorder.ByteOrder) ([]interface{}, error) {
-	cnt, e := byteorder.UVarint(rd, endian)
+func ReadArray(rd io.Reader) ([]interface{}, error) {
+	cnt, e := byteorder.UVarint(rd, byteorder.BigEndian)
 	if e != nil {
 		return nil, e
 	}
@@ -109,7 +114,7 @@ func ReadArray(rd io.Reader, endian byteorder.ByteOrder) ([]interface{}, error) 
 	r := []interface{}{}
 
 	for i, c := 0, int(cnt); i < c; i++ {
-		value, e := Read(rd, endian)
+		value, e := Read(rd)
 		if e != nil {
 			return nil, e
 		}
@@ -120,8 +125,8 @@ func ReadArray(rd io.Reader, endian byteorder.ByteOrder) ([]interface{}, error) 
 	return r, nil
 }
 
-func ReadObject(rd io.Reader, endian byteorder.ByteOrder) (map[String]interface{}, error) {
-	cnt, e := byteorder.UVarint(rd, endian)
+func ReadObject(rd io.Reader) (map[String]interface{}, error) {
+	cnt, e := byteorder.UVarint(rd, byteorder.BigEndian)
 	if e != nil {
 		return nil, e
 	}
@@ -129,12 +134,12 @@ func ReadObject(rd io.Reader, endian byteorder.ByteOrder) (map[String]interface{
 	r := map[String]interface{}{}
 
 	for i, c := 0, int(cnt); i < c; i++ {
-		key, e := ReadString(rd, endian)
+		key, e := ReadString(rd, byteorder.BigEndian)
 		if e != nil {
 			return nil, e
 		}
 
-		value, e := Read(rd, endian)
+		value, e := Read(rd)
 		if e != nil {
 			return nil, e
 		}
@@ -145,7 +150,7 @@ func ReadObject(rd io.Reader, endian byteorder.ByteOrder) (map[String]interface{
 	return r, nil
 }
 
-func Write(wt io.Writer, endian byteorder.ByteOrder, anything interface{}) error {
+func Write(wt io.Writer, anything interface{}) error {
 	switch n := anything.(type) {
 	case nil:
 		if e := byteorder.PutUint8(wt, NullT); e != nil {
@@ -158,7 +163,7 @@ func Write(wt io.Writer, endian byteorder.ByteOrder, anything interface{}) error
 				return e
 			}
 
-			return byteorder.PutVarint(wt, endian, m)
+			return byteorder.PutVarint(wt, byteorder.BigEndian, m)
 		}
 
 		if e := byteorder.PutUint8(wt, NumberT); e != nil {
@@ -170,25 +175,25 @@ func Write(wt io.Writer, endian byteorder.ByteOrder, anything interface{}) error
 			return e
 		}
 
-		return byteorder.PutFloat64(wt, endian, p)
+		return byteorder.PutFloat64(wt, byteorder.BigEndian, p)
 	case float64:
 		if e := byteorder.PutUint8(wt, NumberT); e != nil {
 			return e
 		}
 
-		return byteorder.PutFloat64(wt, endian, n)
+		return byteorder.PutFloat64(wt, byteorder.BigEndian, n)
 	case Varint:
 		if e := byteorder.PutUint8(wt, VarintT); e != nil {
 			return e
 		}
 
-		return n.Write(wt, endian)
+		return n.Write(wt, byteorder.BigEndian)
 	case int64:
 		if e := byteorder.PutUint8(wt, VarintT); e != nil {
 			return e
 		}
 
-		return byteorder.PutVarint(wt, endian, n)
+		return byteorder.PutVarint(wt, byteorder.BigEndian, n)
 	case bool:
 		if e := byteorder.PutUint8(wt, BoolT); e != nil {
 			return e
@@ -196,36 +201,78 @@ func Write(wt io.Writer, endian byteorder.ByteOrder, anything interface{}) error
 
 		return byteorder.PutBool(wt, n)
 	case String:
-		if e := byteorder.PutUint8(wt, StringT); e != nil {
-			return e
-		}
+		switch n {
+		case "____NaN____":
+			if e := byteorder.PutUint8(wt, NumberT); e != nil {
+				return e
+			}
 
-		return n.Write(wt, endian)
+			return byteorder.PutFloat64(wt, byteorder.BigEndian, math.NaN())
+		case "____+Inf____":
+			if e := byteorder.PutUint8(wt, NumberT); e != nil {
+				return e
+			}
+
+			return byteorder.PutFloat64(wt, byteorder.BigEndian, math.Inf(1))
+		case "____-Inf____":
+			if e := byteorder.PutUint8(wt, NumberT); e != nil {
+				return e
+			}
+
+			return byteorder.PutFloat64(wt, byteorder.BigEndian, math.Inf(-1))
+		default:
+			if e := byteorder.PutUint8(wt, StringT); e != nil {
+				return e
+			}
+
+			return n.Write(wt, byteorder.BigEndian)
+		}
 	case string:
-		if e := byteorder.PutUint8(wt, StringT); e != nil {
-			return e
-		}
+		switch n {
+		case "____NaN____":
+			if e := byteorder.PutUint8(wt, NumberT); e != nil {
+				return e
+			}
 
-		r := String(n)
-		return r.Write(wt, endian)
+			return byteorder.PutFloat64(wt, byteorder.BigEndian, math.NaN())
+		case "____+Inf____":
+			if e := byteorder.PutUint8(wt, NumberT); e != nil {
+				return e
+			}
+
+			return byteorder.PutFloat64(wt, byteorder.BigEndian, math.Inf(1))
+		case "____-Inf____":
+			if e := byteorder.PutUint8(wt, NumberT); e != nil {
+				return e
+			}
+
+			return byteorder.PutFloat64(wt, byteorder.BigEndian, math.Inf(-1))
+		default:
+			if e := byteorder.PutUint8(wt, StringT); e != nil {
+				return e
+			}
+
+			r := String(n)
+			return r.Write(wt, byteorder.BigEndian)
+		}
 	case []interface{}:
 		if e := byteorder.PutUint8(wt, ArrayT); e != nil {
 			return e
 		}
 
-		return WriteArray(wt, endian, n)
+		return WriteArray(wt, n)
 	case map[String]interface{}:
 		if e := byteorder.PutUint8(wt, ObjectT); e != nil {
 			return e
 		}
 
-		return WriteObject(wt, endian, n)
+		return WriteObject(wt, n)
 	case map[string]interface{}:
 		if e := byteorder.PutUint8(wt, ObjectT); e != nil {
 			return e
 		}
 
-		return writeobj(wt, endian, n)
+		return writeobj(wt, n)
 	default:
 		return errors.Errorf("unknown type %+v", anything)
 	}
@@ -233,16 +280,16 @@ func Write(wt io.Writer, endian byteorder.ByteOrder, anything interface{}) error
 	return nil
 }
 
-func WriteArray(wt io.Writer, endian byteorder.ByteOrder, array []interface{}) error {
+func WriteArray(wt io.Writer, array []interface{}) error {
 	arrlen := len(array)
 
-	e := byteorder.PutUVarint(wt, endian, uint64(arrlen))
+	e := byteorder.PutUVarint(wt, byteorder.BigEndian, uint64(arrlen))
 	if e != nil {
 		return e
 	}
 
 	for i := 0; i < arrlen; i++ {
-		if e := Write(wt, endian, array[i]); e != nil {
+		if e := Write(wt, array[i]); e != nil {
 			return e
 		}
 	}
@@ -250,18 +297,18 @@ func WriteArray(wt io.Writer, endian byteorder.ByteOrder, array []interface{}) e
 	return nil
 }
 
-func WriteObject(wt io.Writer, endian byteorder.ByteOrder, object map[String]interface{}) error {
-	e := byteorder.PutUVarint(wt, endian, uint64(len(object)))
+func WriteObject(wt io.Writer, object map[String]interface{}) error {
+	e := byteorder.PutUVarint(wt, byteorder.BigEndian, uint64(len(object)))
 	if e != nil {
 		return e
 	}
 
 	for k, v := range object {
-		if e := k.Write(wt, endian); e != nil {
+		if e := k.Write(wt, byteorder.BigEndian); e != nil {
 			return e
 		}
 
-		if e := Write(wt, endian, v); e != nil {
+		if e := Write(wt, v); e != nil {
 			return e
 		}
 	}
@@ -269,8 +316,8 @@ func WriteObject(wt io.Writer, endian byteorder.ByteOrder, object map[String]int
 	return nil
 }
 
-func writeobj(wt io.Writer, endian byteorder.ByteOrder, object map[string]interface{}) error {
-	e := byteorder.PutUVarint(wt, endian, uint64(len(object)))
+func writeobj(wt io.Writer, object map[string]interface{}) error {
+	e := byteorder.PutUVarint(wt, byteorder.BigEndian, uint64(len(object)))
 	if e != nil {
 		return e
 	}
@@ -278,11 +325,11 @@ func writeobj(wt io.Writer, endian byteorder.ByteOrder, object map[string]interf
 	for k, v := range object {
 		r := String(k)
 
-		if e := r.Write(wt, endian); e != nil {
+		if e := r.Write(wt, byteorder.BigEndian); e != nil {
 			return e
 		}
 
-		if e := Write(wt, endian, v); e != nil {
+		if e := Write(wt, v); e != nil {
 			return e
 		}
 	}

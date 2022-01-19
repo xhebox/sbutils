@@ -1,3 +1,5 @@
+Moved to https://github.com/xhebox/revcol
+
 util collections for starbound(game).
 
 list:

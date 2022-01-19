@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
 
+	"github.com/xhebox/bstruct/byteorder"
 	"github.com/xhebox/sbutils/lib/btreedb5"
+	"github.com/xhebox/sbutils/lib/sbvj01"
 )
 
 func main() {
@@ -27,45 +30,103 @@ func main() {
 	defer h.Close()
 
 	switch mode {
-	/*
-		case "records":
-			e = h.DumpBlocks(func(record btreedb5.Record) error {
-				z, e := zlib.NewReader(bytes.NewReader(record.Data))
-				if e != nil {
-					return e
-				}
-
-				f, e := os.OpenFile(hex.EncodeToString(record.Key), os.O_RDWR|os.O_CREATE, 0644)
-				if e != nil {
-					return e
-				}
-
-				io.Copy(f, z)
-
-				z.Close()
-				f.Close()
-				return nil
-			})
-			if e != nil {
-				log.Fatalln(e)
-			}
-	*/
 	default:
 		e = h.Ascend(func(key btreedb5.Key, data []byte) {
 			z, e := zlib.NewReader(bytes.NewReader(data))
 			if e != nil {
-				panic(e)
+				log.Fatalln(e)
 			}
 
-			f, e := os.OpenFile(fmt.Sprintf("data_%s", hex.EncodeToString(key)), os.O_RDWR|os.O_CREATE, 0644)
-			if e != nil {
-				panic(e)
-			}
+			switch key[0] {
+			case 0:
+				f, e := os.OpenFile("metadata", os.O_RDWR|os.O_CREATE, 0644)
+				if e != nil {
+					log.Fatalln(e)
+				}
 
-			io.Copy(f, z)
+				x, e := byteorder.Uint32(z, byteorder.BigEndian)
+				if e != nil {
+					log.Fatalln(e)
+				}
+
+				y, e := byteorder.Uint32(z, byteorder.BigEndian)
+				if e != nil {
+					log.Fatalln(e)
+				}
+
+				hdr, e := sbvj01.ReadHdr(z)
+				if e != nil {
+					log.Fatalln(e)
+				}
+
+				body, e := sbvj01.Read(z)
+				if e != nil {
+					log.Fatalln(e)
+				}
+
+				json, e := json.MarshalIndent(map[string]interface{}{
+					"size": []uint32{x, y},
+					"hdr":  hdr,
+					"body": body,
+				}, "", "\t")
+				if e != nil {
+					log.Fatalln(e)
+				}
+
+				f.Write(json)
+
+				f.Close()
+			case 2:
+				f, e := os.OpenFile(fmt.Sprintf("type2_%s", hex.EncodeToString(key[1:])), os.O_RDWR|os.O_CREATE, 0644)
+				if e != nil {
+					log.Fatalln(e)
+				}
+
+				cnt, e := byteorder.UVarint(z, byteorder.BigEndian)
+				if e != nil {
+					log.Fatalln(e)
+				}
+
+				vjs := []map[string]interface{}{}
+
+				for i, j := 0, int(cnt); i < j; i++ {
+					hdr, e := sbvj01.ReadHdr(z)
+					if e != nil {
+						log.Fatalln(e)
+					}
+
+					body, e := sbvj01.Read(z)
+					if e != nil {
+						log.Fatalln(e)
+					}
+
+					vjs = append(vjs, map[string]interface{}{
+						"hdr":  hdr,
+						"body": body,
+					})
+				}
+
+				json, e := json.MarshalIndent(vjs, "", "\t")
+				if e != nil {
+					fmt.Printf("%v %+v\n", e, vjs)
+					log.Fatalln(e)
+				}
+
+				f.Write(json)
+
+				f.Close()
+			default:
+				f, e := os.OpenFile(fmt.Sprintf("data_%s", hex.EncodeToString(key)), os.O_RDWR|os.O_CREATE, 0644)
+				if e != nil {
+					log.Fatalln(e)
+				}
+
+				io.Copy(f, z)
+
+				f.Close()
+			}
 
 			z.Close()
-			f.Close()
 		})
 		if e != nil {
 			log.Fatalf("%+v\n", e)

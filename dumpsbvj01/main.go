@@ -9,8 +9,8 @@ import (
 	"log"
 	"os"
 
-	"../lib/sbvj01"
 	"github.com/xhebox/bstruct/byteorder"
+	"github.com/xhebox/sbutils/lib/sbvj01"
 )
 
 func main() {
@@ -43,9 +43,11 @@ func main() {
 		outwt = f
 	}
 
+	rd := bytes.NewReader(contents)
+
 	switch mode {
 	case "raw":
-		r, _, e := sbvj01.ParseRaw(contents, byteorder.BigEndian)
+		r, e := sbvj01.Read(rd, byteorder.BigEndian)
 		if e != nil {
 			log.Fatalln(e)
 		}
@@ -60,12 +62,17 @@ func main() {
 			log.Fatalln(e)
 		}
 	case "vj":
-		r, _, e := sbvj01.Parse(contents)
+		r, e := sbvj01.ReadHdr(rd)
 		if e != nil {
 			log.Fatalln(e)
 		}
 
-		out, e := json.MarshalIndent(r, "", "\t")
+		b, e := sbvj01.Read(rd, r.Endian)
+		if e != nil {
+			log.Fatalln(e)
+		}
+
+		out, e := json.MarshalIndent(b, "", "\t")
 		if e != nil {
 			log.Fatalln(e)
 		}
@@ -76,15 +83,20 @@ func main() {
 		}
 	case "nvj":
 		r := int(int8(contents[0]))
+		rd = bytes.NewReader(contents[1:])
 
-		off := 1
 		for i := 0; i < r; i++ {
-			r, l, e := sbvj01.Parse(contents[off:])
+			r, e := sbvj01.ReadHdr(rd)
 			if e != nil {
 				log.Fatalln(e)
 			}
 
-			out, e := json.MarshalIndent(r, "", "\t")
+			b, e := sbvj01.Read(rd, r.Endian)
+			if e != nil {
+				log.Fatalln(e)
+			}
+
+			out, e := json.MarshalIndent(b, "", "\t")
 			if e != nil {
 				log.Fatalln(e)
 			}
@@ -93,23 +105,6 @@ func main() {
 			if e != nil {
 				log.Fatalln(e)
 			}
-
-			off += l
-		}
-	case "vjmagic":
-		r, _, e := sbvj01.ParseMagic(contents)
-		if e != nil {
-			log.Fatalln(e)
-		}
-
-		out, e := json.MarshalIndent(r, "", "\t")
-		if e != nil {
-			log.Fatalln(e)
-		}
-
-		_, e = io.Copy(outwt, bytes.NewReader(out))
-		if e != nil {
-			log.Fatalln(e)
 		}
 	}
 }

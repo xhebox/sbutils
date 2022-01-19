@@ -4,15 +4,18 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
-	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/xhebox/bstruct/byteorder"
 	"github.com/xhebox/sbutils/lib/btreedb5"
+	"github.com/xhebox/sbutils/lib/data_types"
+	"github.com/xhebox/sbutils/lib/sbvj01"
 )
 
 func Exists(name string) bool {
@@ -31,8 +34,7 @@ func main() {
 
 	var h *btreedb5.BTreeDB5
 	var e error
-	//if Exists(in) {
-	if false {
+	if Exists(in) {
 		h, e = btreedb5.Load(in)
 		if e != nil {
 			log.Fatalln(e)
@@ -50,12 +52,15 @@ func main() {
 		log.Fatalln(e)
 	}
 
-	keys := [][]byte{}
-
 	for _, v := range files {
 		fname := v.Name()
 
 		f, e := os.Open(filepath.Join(dir, fname))
+		if e != nil {
+			log.Fatalln(e)
+		}
+
+		fc, e := ioutil.ReadAll(f)
 		if e != nil {
 			log.Fatalln(e)
 		}
@@ -66,38 +71,90 @@ func main() {
 			log.Fatalln(e)
 		}
 
-		if _, e := io.Copy(zw, f); e != nil {
-			log.Fatalln(e)
+		key := make(btreedb5.Key, h.KeySize)
+
+		switch {
+		case fname == "metadata":
+			content := map[string]interface{}{}
+
+			e := json.Unmarshal(fc, &content)
+			if e != nil {
+				log.Fatalln(e)
+			}
+
+			size := content["size"].([]interface{})
+
+			e = byteorder.PutUint32(zw, byteorder.BigEndian, uint32(size[0].(float64)))
+			if e != nil {
+				log.Fatalln(e)
+			}
+
+			e = byteorder.PutUint32(zw, byteorder.BigEndian, uint32(size[1].(float64)))
+			if e != nil {
+				log.Fatalln(e)
+			}
+
+			hdr := content["hdr"].(map[string]interface{})
+
+			e = sbvj01.WriteHdr(zw, sbvj01.VerJsonHdr{
+				Id:        data_types.String(hdr["id"].(string)),
+				Versioned: hdr["versioned"].(bool),
+				Version:   int32(uint32(hdr["version"].(float64))),
+			})
+			if e != nil {
+				log.Fatalln(e)
+			}
+
+			e = sbvj01.Write(zw, content["body"])
+			if e != nil {
+				log.Fatalln(e)
+			}
+		case strings.HasPrefix(fname, "type2_"):
+			content := []interface{}{}
+
+			e := json.Unmarshal(fc, &content)
+			if e != nil {
+				log.Fatalln(e)
+			}
+
+			e = byteorder.PutUVarint(zw, byteorder.BigEndian, uint64(uint(len(content))))
+			if e != nil {
+				log.Fatalln(e)
+			}
+
+			for k := range content {
+				ii := content[k].(map[string]interface{})
+
+				hdr := ii["hdr"].(map[string]interface{})
+
+				e = sbvj01.WriteHdr(zw, sbvj01.VerJsonHdr{
+					Id:        data_types.String(hdr["id"].(string)),
+					Versioned: hdr["versioned"].(bool),
+					Version:   int32(uint32(hdr["version"].(float64))),
+				})
+
+				e = sbvj01.Write(zw, ii["body"])
+				if e != nil {
+					log.Fatalln(e)
+				}
+			}
+		default:
+			zw.Write(fc)
+
+			key, e = hex.DecodeString(fname[5:])
+			if e != nil {
+				log.Fatalln(e)
+			}
+
+			if len(key) != h.KeySize {
+				log.Fatalf("key size is not %d\n", h.KeySize)
+			}
 		}
 
 		zw.Close()
 		f.Close()
 
-		keyhex := fname[5:]
-
-		key, e := hex.DecodeString(keyhex)
-		if e != nil {
-			log.Fatalln(e)
-		}
-
-		if len(key) != h.KeySize {
-			log.Fatalf("key size is not %d\n", h.KeySize)
-		}
-
-		keys = append(keys, key)
-
 		e = h.Insert(key, buf.Bytes())
-		if e != nil {
-			log.Fatalf("%+v\n", e)
-		}
-
-		h.Commit()
-	}
-
-	le := len(keys) - 1
-	for k := range keys {
-		fmt.Println("remove:", keys[le-k])
-		e = h.Remove(keys[le-k])
 		if e != nil {
 			log.Fatalf("%+v\n", e)
 		}
